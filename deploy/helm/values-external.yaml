@@ -1,0 +1,66 @@
+# Values for external deployment mode (ZStack integration)
+# Use this when connecting to ZStack-managed OVN databases
+#
+# In external mode, zstack-ovn-kubernetes:
+# - Connects to ZStack's existing OVN NB/SB databases
+# - Does NOT start local OVN processes (NB DB, SB DB, northd)
+# - Can reference ZStack's existing Logical Switches
+# - Ensures no conflicts with ZStack OVN configuration
+#
+# ZStack Compatibility:
+# - Detects ZStack-managed OVN objects via external_ids
+# - Safe creation/deletion with ownership checking
+# - Supports referencing existing ZStack Logical Switches in Subnet CRD
+
+ovn:
+  # External mode: connect to ZStack OVN databases
+  mode: external
+
+  # ZStack OVN Northbound Database address
+  # Replace with your ZStack management node IP
+  # Supports multiple addresses for HA: "tcp:IP1:6641,tcp:IP2:6641"
+  nbdbAddress: "tcp:192.168.1.100:6641"
+
+  # ZStack OVN Southbound Database address
+  sbdbAddress: "tcp:192.168.1.100:6642"
+
+  # SSL configuration (if ZStack OVN uses SSL)
+  ssl:
+    enabled: false
+    caCert: "/etc/ovn/ca.crt"
+    clientCert: "/etc/ovn/client.crt"
+    clientKey: "/etc/ovn/client.key"
+
+  # Connection settings
+  connectTimeout: 30s
+  reconnectInterval: 1s
+  maxReconnectInterval: 60s
+
+network:
+  # Use the same CIDR as ZStack VPC subnet
+  clusterCIDR: "10.244.0.0/16"
+  serviceCIDR: "10.96.0.0/16"
+  nodeSubnetSize: 24
+
+gateway:
+  # Local gateway mode for distributed traffic
+  mode: local
+
+tunnel:
+  # VXLAN for ZStack compatibility
+  type: vxlan
+  port: 4789
+
+# Example Subnet CRD referencing ZStack Logical Switch:
+# ---
+# apiVersion: network.zstack.io/v1
+# kind: Subnet
+# metadata:
+#   name: zstack-vpc-subnet
+# spec:
+#   cidr: "10.244.0.0/24"
+#   gateway: "10.244.0.1"
+#   externalLogicalSwitch: "ls-zstack-vpc-subnet-uuid"  # ZStack LS name
+#   excludeIPs:
+#     - "10.244.0.1"
+#     - "10.244.0.2-10.244.0.10"

@@ -1,0 +1,59 @@
+# Default Deny All Traffic
+#
+# 此策略拒绝命名空间内所有 Pod 的入站和出站流量。
+# 这是实现零信任网络的基础，之后通过其他策略显式允许需要的流量。
+#
+# 使用方法:
+#   kubectl apply -f default-deny.yaml
+#
+# 注意:
+#   - 应用此策略后，所有 Pod 将无法通信
+#   - 需要配合其他允许策略使用
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: policy-test
+spec:
+  # 选择所有 Pod
+  podSelector: {}
+  
+  # 同时控制入站和出站
+  policyTypes:
+  - Ingress
+  - Egress
+  
+  # 空的 ingress 和 egress 表示拒绝所有
+  # ingress: []
+  # egress: []
+
+---
+# Default Deny Ingress Only
+#
+# 只拒绝入站流量，允许出站
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: policy-test
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+
+---
+# Default Deny Egress Only
+#
+# 只拒绝出站流量，允许入站
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-egress
+  namespace: policy-test
+spec:
+  podSelector: {}
+  policyTypes:
+  - Egress

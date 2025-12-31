@@ -1,0 +1,170 @@
+# Default values for zstack-ovn-kubernetes
+# This is a YAML-formatted file.
+
+# OVN Configuration
+ovn:
+  # Deployment mode: "standalone" or "external"
+  # - standalone: Self-managed OVN databases (for independent K8s clusters)
+  # - external: Connect to external OVN databases (for ZStack integration)
+  mode: standalone
+
+  # Northbound Database address (required for external mode)
+  # Format: tcp:IP:PORT or ssl:IP:PORT
+  nbdbAddress: ""
+
+  # Southbound Database address (required for external mode)
+  sbdbAddress: ""
+
+  # SSL configuration (optional)
+  ssl:
+    enabled: false
+    caCert: ""
+    clientCert: ""
+    clientKey: ""
+
+  # Standalone deployment configuration (only used when mode=standalone)
+  standalone:
+    # High availability mode: "single" or "ha"
+    # - single: Single instance databases (suitable for dev/test)
+    # - ha: 3-node Raft cluster (suitable for production)
+    haMode: single
+
+    # Database image configuration
+    image:
+      repository: ghcr.io/ovn-org/ovn-kubernetes/ovn-kube-ubuntu
+      tag: master
+      pullPolicy: IfNotPresent
+
+    # NB DB configuration
+    nbdb:
+      # Number of replicas (1 for single, 3 for ha)
+      replicas: 1
+      # Storage configuration (recommended for HA mode)
+      storage:
+        enabled: false
+        size: 1Gi
+        storageClass: ""
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+
+    # SB DB configuration
+    sbdb:
+      replicas: 1
+      storage:
+        enabled: false
+        size: 1Gi
+        storageClass: ""
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+
+    # northd configuration
+    northd:
+      replicas: 1
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+
+# Network Configuration
+network:
+  # Pod network CIDR
+  clusterCIDR: "10.244.0.0/16"
+
+  # Service network CIDR
+  serviceCIDR: "10.96.0.0/16"
+
+  # Subnet size for each node (e.g., 24 means /24 subnet per node)
+  nodeSubnetSize: 24
+
+# Gateway Configuration
+gateway:
+  # Gateway mode: "shared" or "local"
+  # - shared: Centralized gateway on specific nodes
+  # - local: Distributed gateway on each node
+  mode: local
+
+  # Network interface for gateway traffic
+  interface: ""
+
+# Tunnel Configuration
+tunnel:
+  # Tunnel type: "vxlan" or "geneve"
+  # VXLAN is recommended for ZStack compatibility
+  type: vxlan
+
+  # Tunnel UDP port
+  port: 4789
+
+# DPDK Configuration (optional)
+dpdk:
+  # Enable DPDK support
+  enabled: false
+
+  # vhost-user socket directory
+  socketDir: "/var/run/openvswitch"
+
+# Controller Configuration
+controller:
+  # Number of controller replicas
+  replicas: 1
+
+  # Image configuration
+  image:
+    repository: ghcr.io/jiayi-1994/zstack-ovnkube-controller
+    tag: "0.1.0"
+    pullPolicy: IfNotPresent
+
+  # Resource limits
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
+# Node Agent Configuration
+node:
+  # Image configuration
+  image:
+    repository: ghcr.io/jiayi-1994/zstack-ovnkube-node
+    tag: "0.1.0"
+    pullPolicy: IfNotPresent
+
+  # Resource limits
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
+# CNI Configuration
+cni:
+  # CNI binary image
+  image:
+    repository: ghcr.io/jiayi-1994/zstack-ovn-cni
+    tag: "0.1.0"
+    pullPolicy: IfNotPresent
+
+# Logging Configuration
+logging:
+  # Log level: debug, info, warn, error
+  level: info
+
+  # Log format: json or text
+  format: json

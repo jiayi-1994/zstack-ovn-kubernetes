@@ -1,0 +1,9 @@
+# Namespace for OVN components in standalone mode
+# This namespace isolates all OVN-related resources
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ovn-kubernetes
+  labels:
+    app.kubernetes.io/name: ovn-kubernetes
+    app.kubernetes.io/component: networking

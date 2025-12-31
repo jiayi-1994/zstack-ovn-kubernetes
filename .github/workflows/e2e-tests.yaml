@@ -1,0 +1,420 @@
+# GitHub Actions workflow for E2E tests
+#
+# This workflow runs end-to-end tests in a Kind cluster on Linux.
+# It validates the complete CNI functionality including:
+# - Pod-to-Pod connectivity (same node and cross-node)
+# - Pod-to-Service connectivity
+# - NetworkPolicy enforcement
+# - Dual mode (standalone/external) functionality
+#
+# Triggers:
+# - Pull requests to main/master branch
+# - Push to main/master branch
+# - Manual trigger (workflow_dispatch)
+#
+# Requirements: 14.1, 14.4, 19.1, 21.1, 21.2, 24.1, 24.2, 24.3
+
+name: E2E Tests
+
+on:
+  pull_request:
+    branches:
+      - main
+      - master
+    paths:
+      - 'cmd/**'
+      - 'pkg/**'
+      - 'api/**'
+      - 'test/e2e/**'
+      - 'deploy/**'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/e2e-tests.yaml'
+
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'cmd/**'
+      - 'pkg/**'
+      - 'api/**'
+      - 'test/e2e/**'
+      - 'deploy/**'
+
+  # Allow manual trigger
+  workflow_dispatch:
+    inputs:
+      debug_enabled:
+        description: 'Enable debug mode (keep cluster running on failure)'
+        required: false
+        default: 'false'
+        type: boolean
+      test_filter:
+        description: 'Ginkgo focus filter (e.g., "Same-Node")'
+        required: false
+        default: ''
+        type: string
+
+env:
+  GO_VERSION: '1.21'
+  KIND_VERSION: 'v0.20.0'
+  KIND_NODE_IMAGE: 'kindest/node:v1.28.0'
+  KUBECTL_VERSION: 'v1.28.0'
+
+# Concurrency settings
+concurrency:
+  group: e2e-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ==========================================================================
+  # Job: Unit Tests (prerequisite)
+  # ==========================================================================
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Run unit tests
+        run: |
+          go test -v -race -coverprofile=coverage.out ./pkg/...
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-coverage
+          path: coverage.out
+          retention-days: 7
+
+  # ==========================================================================
+  # Job: Build Images for E2E
+  # ==========================================================================
+  build-e2e-images:
+    name: Build E2E Images
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build controller image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.controller
+          push: false
+          load: true
+          tags: ghcr.io/jiayi-1994/zstack-ovnkube-controller:e2e
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build node image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.node
+          push: false
+          load: true
+          tags: ghcr.io/jiayi-1994/zstack-ovnkube-node:e2e
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build CNI image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.cni
+          push: false
+          load: true
+          tags: ghcr.io/jiayi-1994/zstack-ovn-cni:e2e
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Save images
+        run: |
+          docker save ghcr.io/jiayi-1994/zstack-ovnkube-controller:e2e \
+                      ghcr.io/jiayi-1994/zstack-ovnkube-node:e2e \
+                      ghcr.io/jiayi-1994/zstack-ovn-cni:e2e \
+            -o e2e-images.tar
+
+      - name: Upload images artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-images
+          path: e2e-images.tar
+          retention-days: 1
+
+  # ==========================================================================
+  # Job: E2E Tests - Standalone Mode
+  # ==========================================================================
+  e2e-standalone:
+    name: E2E Tests (Standalone Mode)
+    runs-on: ubuntu-latest
+    needs: build-e2e-images
+    timeout-minutes: 45
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install Kind
+        run: |
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/${{ env.KIND_VERSION }}/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind version
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/${{ env.KUBECTL_VERSION }}/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+          kubectl version --client
+
+      - name: Download images artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: e2e-images
+
+      - name: Create Kind cluster
+        run: |
+          cat <<EOF | kind create cluster --name e2e-standalone --config=-
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+          - role: control-plane
+          - role: worker
+          - role: worker
+          networking:
+            disableDefaultCNI: true
+            podSubnet: "10.244.0.0/16"
+            serviceSubnet: "10.96.0.0/16"
+          EOF
+
+      - name: Load images into Kind
+        run: |
+          docker load -i e2e-images.tar
+          kind load docker-image ghcr.io/jiayi-1994/zstack-ovnkube-controller:e2e --name e2e-standalone
+          kind load docker-image ghcr.io/jiayi-1994/zstack-ovnkube-node:e2e --name e2e-standalone
+          kind load docker-image ghcr.io/jiayi-1994/zstack-ovn-cni:e2e --name e2e-standalone
+
+      - name: Install OVS on Kind nodes
+        run: |
+          for node in $(kind get nodes --name e2e-standalone); do
+            docker exec $node bash -c "apt-get update && apt-get install -y openvswitch-switch"
+            docker exec $node bash -c "service openvswitch-switch start"
+          done
+
+      - name: Deploy zstack-ovn-kubernetes (Standalone)
+        run: |
+          # Apply CRDs
+          kubectl apply -f deploy/yaml/subnet-crd.yaml
+          
+          # Apply RBAC
+          kubectl apply -f deploy/yaml/rbac.yaml
+          
+          # Apply ConfigMap with standalone settings
+          kubectl apply -f deploy/yaml/configmap.yaml
+          
+          # Deploy OVN databases (standalone mode)
+          kubectl apply -f deploy/yaml/ovn-databases.yaml
+          
+          # Wait for OVN databases to be ready
+          kubectl -n kube-system wait --for=condition=ready pod -l app=ovn-central --timeout=300s || true
+          
+          # Deploy controller
+          kubectl apply -f deploy/yaml/controller-deployment.yaml
+          
+          # Deploy node agent
+          kubectl apply -f deploy/yaml/node-daemonset.yaml
+          
+          # Wait for all pods to be ready
+          sleep 30
+          kubectl -n kube-system get pods
+
+      - name: Wait for CNI to be ready
+        run: |
+          echo "Waiting for CNI pods to be ready..."
+          kubectl -n kube-system wait --for=condition=ready pod -l app.kubernetes.io/name=zstack-ovn-kubernetes --timeout=300s || {
+            echo "CNI pods not ready, checking status..."
+            kubectl -n kube-system get pods -o wide
+            kubectl -n kube-system describe pods -l app.kubernetes.io/name=zstack-ovn-kubernetes
+            exit 1
+          }
+
+      - name: Run E2E tests
+        env:
+          E2E_OVN_MODE: standalone
+          KUBECONFIG: ${{ github.workspace }}/.kube/config
+        run: |
+          # Get kubeconfig
+          kind get kubeconfig --name e2e-standalone > $KUBECONFIG
+          
+          # Install ginkgo
+          go install github.com/onsi/ginkgo/v2/ginkgo@latest
+          
+          # Run E2E tests
+          FOCUS="${{ inputs.test_filter }}"
+          if [ -n "$FOCUS" ]; then
+            ginkgo -v --focus="$FOCUS" ./test/e2e/...
+          else
+            ginkgo -v ./test/e2e/...
+          fi
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          echo "=== CNI Pod Logs ==="
+          kubectl -n kube-system logs -l app.kubernetes.io/name=zstack-ovn-kubernetes --tail=100 || true
+          
+          echo "=== OVN Central Logs ==="
+          kubectl -n kube-system logs -l app=ovn-central --tail=100 || true
+          
+          echo "=== Node Status ==="
+          kubectl get nodes -o wide
+          
+          echo "=== Pod Status ==="
+          kubectl get pods -A -o wide
+          
+          echo "=== Events ==="
+          kubectl get events -A --sort-by='.lastTimestamp' | tail -50
+
+      - name: Debug - Keep cluster running
+        if: failure() && inputs.debug_enabled == 'true'
+        run: |
+          echo "Debug mode enabled. Cluster will remain running."
+          echo "To access the cluster, use: kind get kubeconfig --name e2e-standalone"
+          sleep 3600  # Keep running for 1 hour
+
+      - name: Cleanup
+        if: always() && inputs.debug_enabled != 'true'
+        run: |
+          kind delete cluster --name e2e-standalone || true
+
+  # ==========================================================================
+  # Job: E2E Tests - Connectivity Focus
+  # ==========================================================================
+  e2e-connectivity:
+    name: E2E Connectivity Tests
+    runs-on: ubuntu-latest
+    needs: build-e2e-images
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install Kind
+        run: |
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/${{ env.KIND_VERSION }}/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/${{ env.KUBECTL_VERSION }}/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+
+      - name: Download images artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: e2e-images
+
+      - name: Create Kind cluster (3 nodes)
+        run: |
+          cat <<EOF | kind create cluster --name e2e-connectivity --config=-
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+          - role: control-plane
+          - role: worker
+          - role: worker
+          - role: worker
+          networking:
+            disableDefaultCNI: true
+            podSubnet: "10.244.0.0/16"
+            serviceSubnet: "10.96.0.0/16"
+          EOF
+
+      - name: Load images and setup
+        run: |
+          docker load -i e2e-images.tar
+          kind load docker-image ghcr.io/jiayi-1994/zstack-ovnkube-controller:e2e --name e2e-connectivity
+          kind load docker-image ghcr.io/jiayi-1994/zstack-ovnkube-node:e2e --name e2e-connectivity
+          kind load docker-image ghcr.io/jiayi-1994/zstack-ovn-cni:e2e --name e2e-connectivity
+          
+          # Install OVS on nodes
+          for node in $(kind get nodes --name e2e-connectivity); do
+            docker exec $node bash -c "apt-get update && apt-get install -y openvswitch-switch"
+            docker exec $node bash -c "service openvswitch-switch start"
+          done
+
+      - name: Deploy CNI
+        run: |
+          kubectl apply -f deploy/yaml/
+          sleep 60
+          kubectl -n kube-system get pods
+
+      - name: Run connectivity tests
+        env:
+          E2E_OVN_MODE: standalone
+        run: |
+          kind get kubeconfig --name e2e-connectivity > kubeconfig
+          export KUBECONFIG=$(pwd)/kubeconfig
+          
+          go install github.com/onsi/ginkgo/v2/ginkgo@latest
+          ginkgo -v --focus="Pod Network Connectivity" ./test/e2e/...
+
+      - name: Cleanup
+        if: always()
+        run: |
+          kind delete cluster --name e2e-connectivity || true
+
+  # ==========================================================================
+  # Job: Summary
+  # ==========================================================================
+  e2e-summary:
+    name: E2E Test Summary
+    runs-on: ubuntu-latest
+    needs: [e2e-standalone, e2e-connectivity]
+    if: always()
+    steps:
+      - name: Check results
+        run: |
+          echo "## E2E Test Results"
+          echo ""
+          echo "| Test Suite | Status |"
+          echo "|------------|--------|"
+          echo "| Standalone Mode | ${{ needs.e2e-standalone.result }} |"
+          echo "| Connectivity | ${{ needs.e2e-connectivity.result }} |"
+          echo ""
+          
+          if [[ "${{ needs.e2e-standalone.result }}" == "success" && "${{ needs.e2e-connectivity.result }}" == "success" ]]; then
+            echo "✅ All E2E tests passed!"
+          else
+            echo "❌ Some E2E tests failed. Please check the logs."
+            exit 1
+          fi

@@ -1,0 +1,278 @@
+# Multi-Tier Application Network Policy
+#
+# 此策略实现典型的三层应用架构网络隔离：
+# - Frontend (前端): 接收外部流量，访问 API
+# - API (后端): 接收前端请求，访问数据库
+# - Database (数据库): 只接收 API 请求
+#
+# 流量流向: Internet → Frontend → API → Database
+#
+# 使用方法:
+#   kubectl create namespace multi-tier-app
+#   kubectl apply -f multi-tier-app.yaml
+
+---
+# 命名空间标签（用于跨命名空间策略）
+# kubectl label namespace multi-tier-app name=multi-tier-app
+
+---
+# Frontend 网络策略
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: frontend-policy
+  namespace: multi-tier-app
+spec:
+  podSelector:
+    matchLabels:
+      tier: frontend
+  
+  policyTypes:
+  - Ingress
+  - Egress
+  
+  ingress:
+  # 允许来自 Ingress Controller 的流量
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: ingress-nginx
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: ingress-nginx
+    ports:
+    - protocol: TCP
+      port: 80
+    - protocol: TCP
+      port: 443
+  
+  # 允许来自负载均衡器的流量
+  - from:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+    ports:
+    - protocol: TCP
+      port: 80
+    - protocol: TCP
+      port: 443
+  
+  egress:
+  # 允许访问 API 层
+  - to:
+    - podSelector:
+        matchLabels:
+          tier: api
+    ports:
+    - protocol: TCP
+      port: 8080
+  
+  # 允许 DNS 查询
+  - to:
+    - namespaceSelector: {}
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53
+
+---
+# API 网络策略
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-policy
+  namespace: multi-tier-app
+spec:
+  podSelector:
+    matchLabels:
+      tier: api
+  
+  policyTypes:
+  - Ingress
+  - Egress
+  
+  ingress:
+  # 只允许来自 Frontend 的流量
+  - from:
+    - podSelector:
+        matchLabels:
+          tier: frontend
+    ports:
+    - protocol: TCP
+      port: 8080
+  
+  # 允许健康检查
+  - from:
+    - namespaceSelector: {}
+      podSelector:
+        matchLabels:
+          app: prometheus
+    ports:
+    - protocol: TCP
+      port: 8080
+    - protocol: TCP
+      port: 9090  # metrics 端口
+  
+  egress:
+  # 允许访问数据库层
+  - to:
+    - podSelector:
+        matchLabels:
+          tier: database
+    ports:
+    - protocol: TCP
+      port: 5432  # PostgreSQL
+    - protocol: TCP
+      port: 3306  # MySQL
+  
+  # 允许访问缓存
+  - to:
+    - podSelector:
+        matchLabels:
+          tier: cache
+    ports:
+    - protocol: TCP
+      port: 6379  # Redis
+  
+  # 允许 DNS 查询
+  - to:
+    - namespaceSelector: {}
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53
+  
+  # 允许访问外部 API
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+        except:
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+    ports:
+    - protocol: TCP
+      port: 443
+
+---
+# Database 网络策略
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: database-policy
+  namespace: multi-tier-app
+spec:
+  podSelector:
+    matchLabels:
+      tier: database
+  
+  policyTypes:
+  - Ingress
+  - Egress
+  
+  ingress:
+  # 只允许来自 API 层的流量
+  - from:
+    - podSelector:
+        matchLabels:
+          tier: api
+    ports:
+    - protocol: TCP
+      port: 5432
+    - protocol: TCP
+      port: 3306
+  
+  # 允许数据库集群内部通信
+  - from:
+    - podSelector:
+        matchLabels:
+          tier: database
+    ports:
+    - protocol: TCP
+      port: 5432
+    - protocol: TCP
+      port: 3306
+  
+  egress:
+  # 允许 DNS 查询
+  - to:
+    - namespaceSelector: {}
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53
+  
+  # 允许数据库集群内部通信
+  - to:
+    - podSelector:
+        matchLabels:
+          tier: database
+    ports:
+    - protocol: TCP
+      port: 5432
+    - protocol: TCP
+      port: 3306
+
+---
+# Cache 网络策略
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cache-policy
+  namespace: multi-tier-app
+spec:
+  podSelector:
+    matchLabels:
+      tier: cache
+  
+  policyTypes:
+  - Ingress
+  - Egress
+  
+  ingress:
+  # 允许来自 API 层的流量
+  - from:
+    - podSelector:
+        matchLabels:
+          tier: api
+    ports:
+    - protocol: TCP
+      port: 6379
+  
+  # 允许 Redis 集群内部通信
+  - from:
+    - podSelector:
+        matchLabels:
+          tier: cache
+    ports:
+    - protocol: TCP
+      port: 6379
+    - protocol: TCP
+      port: 16379  # Redis Cluster Bus
+  
+  egress:
+  # 允许 DNS 查询
+  - to:
+    - namespaceSelector: {}
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53
+  
+  # 允许 Redis 集群内部通信
+  - to:
+    - podSelector:
+        matchLabels:
+          tier: cache
+    ports:
+    - protocol: TCP
+      port: 6379
+    - protocol: TCP
+      port: 16379

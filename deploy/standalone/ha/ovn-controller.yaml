@@ -1,0 +1,216 @@
+# OVN Controller DaemonSet - HA Mode
+# ovn-controller runs on each node and is responsible for:
+# - Reading logical flows from SB DB
+# - Programming OVS (Open vSwitch) with physical flows
+# - Managing local port bindings
+# - Handling chassis registration
+#
+# In HA mode, ovn-controller connects to the SB DB cluster service
+# which automatically routes to available database replicas.
+#
+# Reference: OVN-Kubernetes deployment patterns
+# Image: Official OVN-Kubernetes image from ghcr.io
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ovn-controller
+  namespace: ovn-kubernetes
+  labels:
+    app.kubernetes.io/name: ovn-controller
+    app.kubernetes.io/component: node-agent
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ovn-controller
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ovn-controller
+        app.kubernetes.io/component: node-agent
+    spec:
+      tolerations:
+        - operator: Exists
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      serviceAccountName: ovn-controller
+
+      # Wait for SB database cluster to be ready
+      initContainers:
+        - name: wait-for-sb-db
+          image: ghcr.io/ovn-org/ovn-kubernetes/ovn-kube-ubuntu:master
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -ex
+              echo "Waiting for OVN SB DB cluster to be ready..."
+              until ovsdb-client list-dbs tcp:ovn-sb-db.ovn-kubernetes.svc.cluster.local:6642 2>/dev/null | grep -q OVN_Southbound; do
+                echo "SB DB not ready, waiting..."
+                sleep 2
+              done
+              echo "SB DB cluster is ready!"
+        - name: init-ovs
+          image: ghcr.io/ovn-org/ovn-kubernetes/ovn-kube-ubuntu:master
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -ex
+              
+              # Ensure OVS is running
+              echo "Checking OVS status..."
+              if ! ovs-vsctl show > /dev/null 2>&1; then
+                echo "ERROR: OVS is not running. Please ensure openvswitch is installed and running on the host."
+                exit 1
+              fi
+              
+              # Create br-int if not exists
+              if ! ovs-vsctl br-exists br-int; then
+                echo "Creating br-int bridge..."
+                ovs-vsctl add-br br-int -- set Bridge br-int fail-mode=secure protocols=OpenFlow13,OpenFlow15
+              fi
+              
+              # Set external-ids for OVN integration
+              HOSTNAME=$(hostname)
+              echo "Setting OVS external-ids for hostname: ${HOSTNAME}"
+              ovs-vsctl set open . external-ids:system-id="${HOSTNAME}"
+              ovs-vsctl set open . external-ids:hostname="${HOSTNAME}"
+              ovs-vsctl set open . external-ids:ovn-remote="tcp:ovn-sb-db.ovn-kubernetes.svc.cluster.local:6642"
+              ovs-vsctl set open . external-ids:ovn-encap-type="geneve,vxlan"
+              
+              # Get node IP for encapsulation
+              NODE_IP=$(hostname -I | awk '{print $1}')
+              echo "Setting encap IP: ${NODE_IP}"
+              ovs-vsctl set open . external-ids:ovn-encap-ip="${NODE_IP}"
+              
+              echo "OVS initialization complete!"
+          volumeMounts:
+            - name: host-var-run-ovs
+              mountPath: /var/run/openvswitch
+            - name: host-ovs-db
+              mountPath: /etc/openvswitch
+
+      containers:
+        - name: ovn-controller
+          image: ghcr.io/ovn-org/ovn-kubernetes/ovn-kube-ubuntu:master
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+            capabilities:
+              add:
+                - NET_ADMIN
+                - SYS_ADMIN
+                - SYS_NICE
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -ex
+              
+              # Define SB DB connection string (ClusterIP service)
+              OVN_SB_DB="tcp:ovn-sb-db.ovn-kubernetes.svc.cluster.local:6642"
+              
+              echo "Starting OVN controller in HA mode..."
+              echo "SB DB: ${OVN_SB_DB}"
+              
+              # Start ovn-controller
+              exec ovn-controller \
+                -vconsole:info \
+                --pidfile=/var/run/ovn/ovn-controller.pid \
+                --no-chdir \
+                unix:/var/run/openvswitch/db.sock
+          env:
+            - name: OVN_SB_DB
+              value: "tcp:ovn-sb-db.ovn-kubernetes.svc.cluster.local:6642"
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: host-var-run-ovs
+              mountPath: /var/run/openvswitch
+            - name: host-var-run-ovn
+              mountPath: /var/run/ovn
+            - name: host-ovs-db
+              mountPath: /etc/openvswitch
+            - name: host-var-log-ovn
+              mountPath: /var/log/ovn
+          livenessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  pgrep -f ovn-controller > /dev/null
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: host-var-run-ovs
+          hostPath:
+            path: /var/run/openvswitch
+            type: DirectoryOrCreate
+        - name: host-var-run-ovn
+          hostPath:
+            path: /var/run/ovn
+            type: DirectoryOrCreate
+        - name: host-ovs-db
+          hostPath:
+            path: /etc/openvswitch
+            type: DirectoryOrCreate
+        - name: host-var-log-ovn
+          hostPath:
+            path: /var/log/ovn
+            type: DirectoryOrCreate
+---
+# ServiceAccount for ovn-controller
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ovn-controller
+  namespace: ovn-kubernetes
+---
+# ClusterRole for ovn-controller
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ovn-controller
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+# ClusterRoleBinding for ovn-controller
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ovn-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ovn-controller
+subjects:
+  - kind: ServiceAccount
+    name: ovn-controller
+    namespace: ovn-kubernetes

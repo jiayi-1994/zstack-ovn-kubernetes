@@ -1,0 +1,108 @@
+# Allow External Egress Traffic
+#
+# 此策略允许 Pod 访问外部网络资源。
+# 适用于需要访问外部 API、数据库或其他服务的场景。
+#
+# 使用方法:
+#   kubectl apply -f allow-external-egress.yaml
+
+# 允许访问外部 HTTPS 和 DNS
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-external-https
+  namespace: policy-test
+spec:
+  podSelector:
+    matchLabels:
+      app: web
+  
+  policyTypes:
+  - Egress
+  
+  egress:
+  # 允许 DNS 查询
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  
+  # 允许访问外部 HTTPS (排除内网)
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+        except:
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+    ports:
+    - protocol: TCP
+      port: 443
+
+---
+# 允许访问特定外部 IP
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-specific-external
+  namespace: policy-test
+spec:
+  podSelector:
+    matchLabels:
+      app: api
+  
+  policyTypes:
+  - Egress
+  
+  egress:
+  # 允许 DNS
+  - to:
+    - namespaceSelector: {}
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53
+  
+  # 允许访问特定外部服务
+  - to:
+    - ipBlock:
+        cidr: 203.0.113.0/24  # 外部 API 服务器
+    ports:
+    - protocol: TCP
+      port: 443
+  
+  # 允许访问外部数据库
+  - to:
+    - ipBlock:
+        cidr: 198.51.100.10/32  # 外部数据库 IP
+    ports:
+    - protocol: TCP
+      port: 5432
+
+---
+# 允许所有出站流量（宽松策略）
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-all-egress
+  namespace: policy-test
+spec:
+  podSelector:
+    matchLabels:
+      egress: unrestricted
+  
+  policyTypes:
+  - Egress
+  
+  egress:
+  - {}  # 允许所有出站

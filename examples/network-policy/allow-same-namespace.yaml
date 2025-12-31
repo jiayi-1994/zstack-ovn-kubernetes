@@ -1,0 +1,67 @@
+# Allow Same Namespace Communication
+#
+# 此策略允许同一命名空间内的 Pod 互相通信。
+# 适用于需要命名空间级别隔离的场景。
+#
+# 使用方法:
+#   kubectl apply -f allow-same-namespace.yaml
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-same-namespace
+  namespace: policy-test
+spec:
+  # 选择所有 Pod
+  podSelector: {}
+  
+  policyTypes:
+  - Ingress
+  - Egress
+  
+  ingress:
+  # 允许来自同命名空间的所有 Pod
+  - from:
+    - podSelector: {}
+  
+  egress:
+  # 允许访问同命名空间的所有 Pod
+  - to:
+    - podSelector: {}
+  
+  # 允许 DNS 查询 (kube-system 命名空间)
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+
+---
+# Allow Cross-Namespace Communication
+#
+# 允许特定命名空间之间的通信
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-from-monitoring
+  namespace: policy-test
+spec:
+  podSelector: {}
+  
+  policyTypes:
+  - Ingress
+  
+  ingress:
+  # 允许来自 monitoring 命名空间的流量
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: monitoring

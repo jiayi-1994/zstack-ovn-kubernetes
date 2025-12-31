@@ -1,0 +1,29 @@
+# Kustomization for zstack-ovn-kubernetes
+# Use this to deploy all components with kubectl apply -k
+#
+# For standalone mode (self-managed OVN):
+#   kubectl apply -k deploy/yaml/
+#
+# For external mode (ZStack integration):
+#   1. Edit configmap.yaml to set ovn.mode=external and database addresses
+#   2. Remove ovn-databases.yaml from resources list below
+#   3. kubectl apply -k deploy/yaml/
+---
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: zstack-ovn-kubernetes
+
+resources:
+  - namespace.yaml
+  - subnet-crd.yaml
+  - configmap.yaml
+  - rbac.yaml
+  - ovn-databases.yaml      # Remove this line for external mode
+  - controller-deployment.yaml
+  - node-daemonset.yaml
+
+# Common labels applied to all resources
+commonLabels:
+  app.kubernetes.io/name: zstack-ovn-kubernetes
+  app.kubernetes.io/version: "0.1.0"

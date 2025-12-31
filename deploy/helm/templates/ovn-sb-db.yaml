@@ -1,0 +1,300 @@
+{{- if eq .Values.ovn.mode "standalone" }}
+# OVN Southbound Database
+# The SB DB stores logical flow tables and chassis bindings
+# ovn-controller on each node reads from SB DB to program OVS flows
+# Only deployed in standalone mode
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ovn-sb-db
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zstack-ovn-kubernetes.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ovn-sb-db
+spec:
+  type: ClusterIP
+  ports:
+    - name: sb-db
+      port: 6642
+      targetPort: 6642
+      protocol: TCP
+    - name: sb-db-raft
+      port: 6644
+      targetPort: 6644
+      protocol: TCP
+  selector:
+    {{- include "zstack-ovn-kubernetes.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: ovn-sb-db
+{{- if eq .Values.ovn.standalone.haMode "ha" }}
+---
+# Headless service for Raft cluster discovery
+apiVersion: v1
+kind: Service
+metadata:
+  name: ovn-sb-db-headless
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zstack-ovn-kubernetes.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ovn-sb-db
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+    - name: sb-db
+      port: 6642
+      targetPort: 6642
+      protocol: TCP
+    - name: sb-db-raft
+      port: 6644
+      targetPort: 6644
+      protocol: TCP
+  selector:
+    {{- include "zstack-ovn-kubernetes.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: ovn-sb-db
+{{- end }}
+---
+{{- if eq .Values.ovn.standalone.haMode "ha" }}
+# StatefulSet for HA mode (3-node Raft cluster)
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ovn-sb-db
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zstack-ovn-kubernetes.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ovn-sb-db
+spec:
+  serviceName: ovn-sb-db-headless
+  replicas: {{ .Values.ovn.standalone.sbdb.replicas }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "zstack-ovn-kubernetes.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: ovn-sb-db
+  template:
+    metadata:
+      labels:
+        {{- include "zstack-ovn-kubernetes.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: ovn-sb-db
+    spec:
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: Exists
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  {{- include "zstack-ovn-kubernetes.selectorLabels" . | nindent 18 }}
+                  app.kubernetes.io/component: ovn-sb-db
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: ovn-sb-db
+          image: {{ include "zstack-ovn-kubernetes.ovnImage" . }}
+          imagePullPolicy: {{ .Values.ovn.standalone.image.pullPolicy }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -ex
+              
+              # Determine cluster members
+              CLUSTER_MEMBERS=""
+              for i in $(seq 0 2); do
+                if [ -n "$CLUSTER_MEMBERS" ]; then
+                  CLUSTER_MEMBERS="${CLUSTER_MEMBERS},"
+                fi
+                CLUSTER_MEMBERS="${CLUSTER_MEMBERS}tcp:ovn-sb-db-${i}.ovn-sb-db-headless.{{ .Release.Namespace }}.svc.cluster.local:6644"
+              done
+              
+              # Initialize or join cluster
+              if [ ! -f /var/lib/ovn/ovnsb_db.db ]; then
+                if [ "$HOSTNAME" = "ovn-sb-db-0" ]; then
+                  echo "Initializing SB DB cluster leader..."
+                  ovsdb-tool create-cluster /var/lib/ovn/ovnsb_db.db /usr/share/ovn/ovn-sb.ovsschema \
+                    tcp:${HOSTNAME}.ovn-sb-db-headless.{{ .Release.Namespace }}.svc.cluster.local:6644
+                else
+                  echo "Joining SB DB cluster..."
+                  ovsdb-tool join-cluster /var/lib/ovn/ovnsb_db.db OVN_Southbound \
+                    tcp:${HOSTNAME}.ovn-sb-db-headless.{{ .Release.Namespace }}.svc.cluster.local:6644 \
+                    tcp:ovn-sb-db-0.ovn-sb-db-headless.{{ .Release.Namespace }}.svc.cluster.local:6644
+                fi
+              fi
+              
+              exec ovsdb-server /var/lib/ovn/ovnsb_db.db \
+                --remote=ptcp:6642:0.0.0.0 \
+                --remote=db:OVN_Southbound,SB_Global,connections \
+                --private-key=db:OVN_Southbound,SSL,private_key \
+                --certificate=db:OVN_Southbound,SSL,certificate \
+                --ca-cert=db:OVN_Southbound,SSL,ca_cert \
+                --pidfile=/var/run/ovn/ovnsb_db.pid \
+                --log-file=/var/log/ovn/ovsdb-server-sb.log \
+                --no-chdir
+          ports:
+            - name: sb-db
+              containerPort: 6642
+              protocol: TCP
+            - name: sb-db-raft
+              containerPort: 6644
+              protocol: TCP
+          volumeMounts:
+            - name: ovn-data
+              mountPath: /var/lib/ovn
+            - name: ovn-run
+              mountPath: /var/run/ovn
+            - name: ovn-log
+              mountPath: /var/log/ovn
+          livenessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - ovsdb-client list-dbs tcp:127.0.0.1:6642 | grep -q OVN_Southbound
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - ovsdb-client list-dbs tcp:127.0.0.1:6642 | grep -q OVN_Southbound
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            {{- toYaml .Values.ovn.standalone.sbdb.resources | nindent 12 }}
+      volumes:
+        - name: ovn-run
+          emptyDir: {}
+        - name: ovn-log
+          emptyDir: {}
+  {{- if .Values.ovn.standalone.sbdb.storage.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: ovn-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.ovn.standalone.sbdb.storage.storageClass }}
+        storageClassName: {{ .Values.ovn.standalone.sbdb.storage.storageClass }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.ovn.standalone.sbdb.storage.size }}
+  {{- else }}
+        - name: ovn-data
+          emptyDir: {}
+  {{- end }}
+{{- else }}
+# Deployment for single instance mode
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ovn-sb-db
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zstack-ovn-kubernetes.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ovn-sb-db
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "zstack-ovn-kubernetes.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: ovn-sb-db
+  template:
+    metadata:
+      labels:
+        {{- include "zstack-ovn-kubernetes.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: ovn-sb-db
+    spec:
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: Exists
+      containers:
+        - name: ovn-sb-db
+          image: {{ include "zstack-ovn-kubernetes.ovnImage" . }}
+          imagePullPolicy: {{ .Values.ovn.standalone.image.pullPolicy }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -ex
+              if [ ! -f /var/lib/ovn/ovnsb_db.db ]; then
+                echo "Initializing OVN Southbound Database..."
+                ovsdb-tool create /var/lib/ovn/ovnsb_db.db /usr/share/ovn/ovn-sb.ovsschema
+              fi
+              
+              exec /usr/share/ovn/scripts/ovn-ctl run_sb_ovsdb \
+                --db-sb-addr=0.0.0.0 \
+                --db-sb-port=6642 \
+                --db-sb-create-insecure-remote=yes \
+                --ovn-sb-db-ssl-key= \
+                --ovn-sb-db-ssl-cert= \
+                --ovn-sb-db-ssl-ca-cert=
+          ports:
+            - name: sb-db
+              containerPort: 6642
+              protocol: TCP
+            - name: sb-db-raft
+              containerPort: 6644
+              protocol: TCP
+          volumeMounts:
+            - name: ovn-data
+              mountPath: /var/lib/ovn
+            - name: ovn-run
+              mountPath: /var/run/ovn
+          livenessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - ovsdb-client list-dbs tcp:127.0.0.1:6642 | grep -q OVN_Southbound
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - ovsdb-client list-dbs tcp:127.0.0.1:6642 | grep -q OVN_Southbound
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            {{- toYaml .Values.ovn.standalone.sbdb.resources | nindent 12 }}
+      volumes:
+        - name: ovn-data
+          emptyDir: {}
+        - name: ovn-run
+          emptyDir: {}
+{{- end }}
+{{- end }}

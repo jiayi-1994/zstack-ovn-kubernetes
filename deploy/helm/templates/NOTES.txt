@@ -1,0 +1,90 @@
+Thank you for installing {{ .Chart.Name }}!
+
+Your release is named: {{ .Release.Name }}
+Namespace: {{ .Release.Namespace }}
+
+=== Deployment Mode ===
+{{- if eq .Values.ovn.mode "standalone" }}
+Mode: Standalone (self-managed OVN databases)
+{{- if eq .Values.ovn.standalone.haMode "ha" }}
+HA Mode: Enabled (3-node Raft cluster)
+{{- else }}
+HA Mode: Disabled (single instance)
+{{- end }}
+
+OVN NB DB: tcp:ovn-nb-db.{{ .Release.Namespace }}.svc.cluster.local:6641
+OVN SB DB: tcp:ovn-sb-db.{{ .Release.Namespace }}.svc.cluster.local:6642
+{{- else }}
+Mode: External (connecting to ZStack OVN databases)
+OVN NB DB: {{ .Values.ovn.nbdbAddress }}
+OVN SB DB: {{ .Values.ovn.sbdbAddress }}
+{{- end }}
+
+=== Network Configuration ===
+Cluster CIDR: {{ .Values.network.clusterCIDR }}
+Service CIDR: {{ .Values.network.serviceCIDR }}
+Node Subnet Size: /{{ .Values.network.nodeSubnetSize }}
+Gateway Mode: {{ .Values.gateway.mode }}
+Tunnel Type: {{ .Values.tunnel.type }}
+
+=== Components ===
+Controller: {{ include "zstack-ovn-kubernetes.fullname" . }}-controller
+Node Agent: {{ include "zstack-ovn-kubernetes.fullname" . }}-node (DaemonSet)
+
+=== Verify Installation ===
+1. Check controller status:
+   kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/component=controller
+
+2. Check node agent status:
+   kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/component=node
+
+{{- if eq .Values.ovn.mode "standalone" }}
+3. Check OVN database status:
+   kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/component=ovn-nb-db
+   kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/component=ovn-sb-db
+{{- end }}
+
+4. Verify CNI installation on nodes:
+   kubectl get nodes -o wide
+   ls /etc/cni/net.d/10-zstack-ovn.conflist  # On each node
+
+=== Create a Subnet ===
+Example subnet configuration:
+
+{{- if eq .Values.ovn.mode "external" }}
+# For external mode (referencing ZStack Logical Switch):
+apiVersion: network.zstack.io/v1
+kind: Subnet
+metadata:
+  name: zstack-vpc-subnet
+spec:
+  cidr: "10.244.0.0/24"
+  gateway: "10.244.0.1"
+  externalLogicalSwitch: "ls-zstack-vpc-subnet-uuid"
+  excludeIPs:
+    - "10.244.0.1"
+{{- else }}
+# For standalone mode:
+apiVersion: network.zstack.io/v1
+kind: Subnet
+metadata:
+  name: default-subnet
+spec:
+  cidr: "10.244.0.0/24"
+  gateway: "10.244.0.1"
+  excludeIPs:
+    - "10.244.0.1"
+{{- end }}
+
+=== Troubleshooting ===
+- View controller logs:
+  kubectl logs -n {{ .Release.Namespace }} -l app.kubernetes.io/component=controller -f
+
+- View node agent logs:
+  kubectl logs -n {{ .Release.Namespace }} -l app.kubernetes.io/component=node -f
+
+- Check OVN database connectivity:
+  kubectl exec -n {{ .Release.Namespace }} -it deploy/{{ include "zstack-ovn-kubernetes.fullname" . }}-controller -- \
+    ovsdb-client list-dbs {{ include "zstack-ovn-kubernetes.nbdbAddress" . }}
+
+For more information, visit: https://github.com/jiayi-1994/zstack-ovn-kubernetes

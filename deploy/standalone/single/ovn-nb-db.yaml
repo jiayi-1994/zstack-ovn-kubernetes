@@ -1,0 +1,138 @@
+# OVN Northbound Database - Single Instance Mode
+# The NB DB stores high-level network configuration (logical switches, routers, ports, ACLs)
+# In single-node mode, we use a simple Pod with persistent storage
+#
+# Reference: OVN-Kubernetes deployment patterns
+# Image: Official OVN-Kubernetes image from ghcr.io
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ovn-nb-db
+  namespace: ovn-kubernetes
+  labels:
+    app.kubernetes.io/name: ovn-nb-db
+    app.kubernetes.io/component: database
+spec:
+  type: ClusterIP
+  ports:
+    - name: nb-db
+      port: 6641
+      targetPort: 6641
+      protocol: TCP
+    - name: nb-db-raft
+      port: 6643
+      targetPort: 6643
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: ovn-nb-db
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ovn-nb-db
+  namespace: ovn-kubernetes
+  labels:
+    app.kubernetes.io/name: ovn-nb-db
+    app.kubernetes.io/component: database
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate  # Single instance, use Recreate to avoid conflicts
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ovn-nb-db
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ovn-nb-db
+        app.kubernetes.io/component: database
+    spec:
+      # Run on control-plane nodes for stability
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: Exists
+
+      containers:
+        - name: ovn-nb-db
+          # Using official OVN-Kubernetes image
+          image: ghcr.io/ovn-org/ovn-kubernetes/ovn-kube-ubuntu:master
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -ex
+              # Initialize NB DB if not exists
+              if [ ! -f /var/lib/ovn/ovnnb_db.db ]; then
+                echo "Initializing OVN Northbound Database..."
+                ovsdb-tool create /var/lib/ovn/ovnnb_db.db /usr/share/ovn/ovn-nb.ovsschema
+              fi
+              
+              # Start NB DB server
+              # --remote=ptcp:6641 - Listen on TCP port 6641 for client connections
+              # --remote=db:OVN_Northbound,NB_Global,connections - Allow connections from NB_Global table
+              exec /usr/share/ovn/scripts/ovn-ctl run_nb_ovsdb \
+                --db-nb-addr=0.0.0.0 \
+                --db-nb-port=6641 \
+                --db-nb-create-insecure-remote=yes \
+                --ovn-nb-db-ssl-key= \
+                --ovn-nb-db-ssl-cert= \
+                --ovn-nb-db-ssl-ca-cert=
+          ports:
+            - name: nb-db
+              containerPort: 6641
+              protocol: TCP
+            - name: nb-db-raft
+              containerPort: 6643
+              protocol: TCP
+          volumeMounts:
+            - name: ovn-data
+              mountPath: /var/lib/ovn
+            - name: ovn-run
+              mountPath: /var/run/ovn
+          livenessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  ovsdb-client list-dbs tcp:127.0.0.1:6641 | grep -q OVN_Northbound
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  ovsdb-client list-dbs tcp:127.0.0.1:6641 | grep -q OVN_Northbound
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: ovn-data
+          emptyDir: {}  # For production, use PersistentVolumeClaim
+        - name: ovn-run
+          emptyDir: {}

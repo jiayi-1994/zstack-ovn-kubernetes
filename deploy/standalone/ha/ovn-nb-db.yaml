@@ -1,0 +1,219 @@
+# OVN Northbound Database - High Availability Mode (3-node Raft Cluster)
+# The NB DB stores high-level network configuration (logical switches, routers, ports, ACLs)
+# In HA mode, we use a 3-node Raft cluster for fault tolerance
+#
+# Raft Cluster:
+# - 3 replicas provide tolerance for 1 node failure
+# - Leader election is automatic
+# - Data is replicated across all nodes
+#
+# Reference: OVN-Kubernetes HA deployment patterns
+# Image: Official OVN-Kubernetes image from ghcr.io
+---
+# Headless Service for Raft cluster discovery
+# Each pod gets a stable DNS name: ovn-nb-db-{0,1,2}.ovn-nb-db-headless.ovn-kubernetes.svc.cluster.local
+apiVersion: v1
+kind: Service
+metadata:
+  name: ovn-nb-db-headless
+  namespace: ovn-kubernetes
+  labels:
+    app.kubernetes.io/name: ovn-nb-db
+    app.kubernetes.io/component: database
+spec:
+  type: ClusterIP
+  clusterIP: None  # Headless service for StatefulSet
+  ports:
+    - name: nb-db
+      port: 6641
+      targetPort: 6641
+      protocol: TCP
+    - name: nb-db-raft
+      port: 6643
+      targetPort: 6643
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: ovn-nb-db
+---
+# ClusterIP Service for client connections
+# Clients connect to this service, which load-balances to available pods
+apiVersion: v1
+kind: Service
+metadata:
+  name: ovn-nb-db
+  namespace: ovn-kubernetes
+  labels:
+    app.kubernetes.io/name: ovn-nb-db
+    app.kubernetes.io/component: database
+spec:
+  type: ClusterIP
+  ports:
+    - name: nb-db
+      port: 6641
+      targetPort: 6641
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: ovn-nb-db
+
+---
+# StatefulSet for NB DB Raft cluster
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ovn-nb-db
+  namespace: ovn-kubernetes
+  labels:
+    app.kubernetes.io/name: ovn-nb-db
+    app.kubernetes.io/component: database
+spec:
+  serviceName: ovn-nb-db-headless
+  replicas: 3
+  podManagementPolicy: Parallel  # Start all pods simultaneously
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ovn-nb-db
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ovn-nb-db
+        app.kubernetes.io/component: database
+    spec:
+      # Prefer control-plane nodes but allow scheduling on workers
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+      affinity:
+        # Spread pods across different nodes for HA
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: ovn-nb-db
+                topologyKey: kubernetes.io/hostname
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 50
+              preference:
+                matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: Exists
+
+      containers:
+        - name: ovn-nb-db
+          image: ghcr.io/ovn-org/ovn-kubernetes/ovn-kube-ubuntu:master
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -ex
+              
+              # Get pod identity from hostname (ovn-nb-db-0, ovn-nb-db-1, ovn-nb-db-2)
+              POD_NAME=$(hostname)
+              POD_INDEX=${POD_NAME##*-}
+              
+              # Define cluster members
+              CLUSTER_SIZE=3
+              SERVICE_NAME="ovn-nb-db-headless"
+              NAMESPACE="ovn-kubernetes"
+              DOMAIN="${SERVICE_NAME}.${NAMESPACE}.svc.cluster.local"
+              
+              # Build cluster member list for Raft
+              CLUSTER_MEMBERS=""
+              for i in $(seq 0 $((CLUSTER_SIZE - 1))); do
+                if [ -n "$CLUSTER_MEMBERS" ]; then
+                  CLUSTER_MEMBERS="${CLUSTER_MEMBERS},"
+                fi
+                CLUSTER_MEMBERS="${CLUSTER_MEMBERS}tcp:ovn-nb-db-${i}.${DOMAIN}:6643"
+              done
+              
+              MY_ADDRESS="tcp:${POD_NAME}.${DOMAIN}:6643"
+              DB_FILE="/var/lib/ovn/ovnnb_db.db"
+              
+              echo "Pod: ${POD_NAME}, Index: ${POD_INDEX}"
+              echo "My Address: ${MY_ADDRESS}"
+              echo "Cluster Members: ${CLUSTER_MEMBERS}"
+              
+              # Initialize or join Raft cluster
+              if [ ! -f "${DB_FILE}" ]; then
+                if [ "${POD_INDEX}" == "0" ]; then
+                  echo "Initializing new Raft cluster as leader..."
+                  ovsdb-tool create-cluster "${DB_FILE}" /usr/share/ovn/ovn-nb.ovsschema "${MY_ADDRESS}"
+                else
+                  echo "Joining existing Raft cluster..."
+                  # Wait for leader to be ready
+                  sleep 5
+                  LEADER_ADDRESS="tcp:ovn-nb-db-0.${DOMAIN}:6643"
+                  ovsdb-tool join-cluster "${DB_FILE}" OVN_Northbound "${MY_ADDRESS}" "${LEADER_ADDRESS}"
+                fi
+              fi
+              
+              # Start OVSDB server in Raft mode
+              exec ovsdb-server "${DB_FILE}" \
+                --remote=ptcp:6641:0.0.0.0 \
+                --remote=ptcp:6643:0.0.0.0 \
+                --pidfile=/var/run/ovn/ovnnb_db.pid \
+                --log-file=/var/log/ovn/ovnnb_db.log \
+                --no-chdir \
+                -vconsole:info
+          ports:
+            - name: nb-db
+              containerPort: 6641
+              protocol: TCP
+            - name: nb-db-raft
+              containerPort: 6643
+              protocol: TCP
+          volumeMounts:
+            - name: ovn-data
+              mountPath: /var/lib/ovn
+            - name: ovn-run
+              mountPath: /var/run/ovn
+            - name: ovn-log
+              mountPath: /var/log/ovn
+          livenessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  ovsdb-client list-dbs tcp:127.0.0.1:6641 | grep -q OVN_Northbound
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  ovsdb-client list-dbs tcp:127.0.0.1:6641 | grep -q OVN_Northbound
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+      volumes:
+        - name: ovn-run
+          emptyDir: {}
+        - name: ovn-log
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: ovn-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

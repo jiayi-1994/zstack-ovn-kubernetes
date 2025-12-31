@@ -1,0 +1,77 @@
+# Values for standalone HA deployment mode
+# Use this for production deployments requiring high availability
+# Deploys OVN databases as 3-node Raft clusters
+
+ovn:
+  # Standalone mode: self-managed OVN databases
+  mode: standalone
+
+  # OVN databases will be deployed as part of this chart
+  nbdbAddress: ""
+  sbdbAddress: ""
+
+  # Standalone deployment configuration
+  standalone:
+    # High availability mode: "ha" for 3-node Raft cluster
+    haMode: ha
+
+    # Database image configuration
+    image:
+      repository: ghcr.io/ovn-org/ovn-kubernetes/ovn-kube-ubuntu
+      tag: master
+      pullPolicy: IfNotPresent
+
+    # NB DB configuration - 3 replicas for HA
+    nbdb:
+      replicas: 3
+      # Storage configuration for persistent data
+      storage:
+        enabled: true
+        size: 1Gi
+        # Specify storageClass if needed, empty uses default
+        storageClass: ""
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 1000m
+          memory: 1Gi
+
+    # SB DB configuration - 3 replicas for HA
+    sbdb:
+      replicas: 3
+      storage:
+        enabled: true
+        size: 1Gi
+        storageClass: ""
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 1000m
+          memory: 1Gi
+
+    # northd configuration - 2 replicas for active-standby
+    northd:
+      replicas: 2
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 1000m
+          memory: 1Gi
+
+network:
+  clusterCIDR: "10.244.0.0/16"
+  serviceCIDR: "10.96.0.0/16"
+  nodeSubnetSize: 24
+
+gateway:
+  mode: local
+
+tunnel:
+  type: vxlan
+  port: 4789

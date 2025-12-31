@@ -1,0 +1,280 @@
+# Node Agent DaemonSet
+# zstack-ovnkube-node runs on every node and is responsible for:
+# - Running the CNI Server (Unix socket for CNI plugin communication)
+# - Configuring local OVS bridges and ports
+# - Managing node-level network configuration (tunnels, gateways)
+# - Installing CNI binary and configuration
+#
+# Requires privileged access for network configuration
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "zstack-ovn-kubernetes.fullname" . }}-node
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zstack-ovn-kubernetes.node.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "zstack-ovn-kubernetes.node.selectorLabels" . | nindent 6 }}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        {{- include "zstack-ovn-kubernetes.node.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "zstack-ovn-kubernetes.node.serviceAccountName" . }}
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      
+      # Run on all nodes including control-plane
+      tolerations:
+        - operator: Exists
+      
+      # Install CNI binary and configuration
+      initContainers:
+        - name: install-cni
+          image: "{{ .Values.cni.image.repository }}:{{ .Values.cni.image.tag }}"
+          imagePullPolicy: {{ .Values.cni.image.pullPolicy }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -ex
+              # Copy CNI binary
+              echo "Installing CNI binary..."
+              cp /zstack-ovn-cni /host/opt/cni/bin/zstack-ovn-cni
+              chmod +x /host/opt/cni/bin/zstack-ovn-cni
+              
+              # Copy CNI configuration
+              echo "Installing CNI configuration..."
+              cp /etc/cni-conf/cni-conf.json /host/etc/cni/net.d/10-zstack-ovn.conflist
+              
+              echo "CNI installation complete!"
+          volumeMounts:
+            - name: cni-bin
+              mountPath: /host/opt/cni/bin
+            - name: cni-conf
+              mountPath: /host/etc/cni/net.d
+            - name: config
+              mountPath: /etc/cni-conf
+              readOnly: true
+          securityContext:
+            privileged: true
+
+        - name: init-ovs
+          image: {{ include "zstack-ovn-kubernetes.ovnImage" . }}
+          imagePullPolicy: {{ .Values.ovn.standalone.image.pullPolicy }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -ex
+              
+              # Ensure OVS is running
+              echo "Checking OVS status..."
+              if ! ovs-vsctl show > /dev/null 2>&1; then
+                echo "ERROR: OVS is not running. Please ensure openvswitch is installed and running on the host."
+                exit 1
+              fi
+              
+              # Create br-int if not exists
+              if ! ovs-vsctl br-exists br-int; then
+                echo "Creating br-int bridge..."
+                ovs-vsctl add-br br-int -- set Bridge br-int fail-mode=secure protocols=OpenFlow13,OpenFlow15
+              fi
+              
+              # Set external-ids for OVN integration
+              HOSTNAME=$(hostname)
+              echo "Setting OVS external-ids for hostname: ${HOSTNAME}"
+              ovs-vsctl set open . external-ids:system-id="${HOSTNAME}"
+              ovs-vsctl set open . external-ids:hostname="${HOSTNAME}"
+              ovs-vsctl set open . external-ids:ovn-remote="{{ include "zstack-ovn-kubernetes.sbdbAddress" . }}"
+              ovs-vsctl set open . external-ids:ovn-encap-type="{{ .Values.tunnel.type }}"
+              
+              # Get node IP for encapsulation
+              NODE_IP=$(hostname -I | awk '{print $1}')
+              echo "Setting encap IP: ${NODE_IP}"
+              ovs-vsctl set open . external-ids:ovn-encap-ip="${NODE_IP}"
+              
+              echo "OVS initialization complete!"
+          volumeMounts:
+            - name: host-var-run-ovs
+              mountPath: /var/run/openvswitch
+            - name: host-ovs-db
+              mountPath: /etc/openvswitch
+          securityContext:
+            privileged: true
+
+      containers:
+        # Node agent container
+        - name: node
+          image: "{{ .Values.node.image.repository }}:{{ .Values.node.image.tag }}"
+          imagePullPolicy: {{ .Values.node.image.pullPolicy }}
+          command:
+            - /zstack-ovnkube-node
+          args:
+            - --config=/etc/zstack-ovn/config.yaml
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: OVN_NB_DB
+              value: {{ include "zstack-ovn-kubernetes.nbdbAddress" . | quote }}
+            - name: OVN_SB_DB
+              value: {{ include "zstack-ovn-kubernetes.sbdbAddress" . | quote }}
+          ports:
+            - name: metrics
+              containerPort: 9091
+              protocol: TCP
+            - name: health
+              containerPort: 8082
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            {{- toYaml .Values.node.resources | nindent 12 }}
+          securityContext:
+            privileged: true
+            capabilities:
+              add:
+                - NET_ADMIN
+                - SYS_ADMIN
+                - SYS_NICE
+          volumeMounts:
+            - name: config
+              mountPath: /etc/zstack-ovn
+              readOnly: true
+            - name: host-var-run-ovs
+              mountPath: /var/run/openvswitch
+            - name: host-var-run-ovn
+              mountPath: /var/run/ovn
+            - name: host-var-run-zstack-ovn
+              mountPath: /var/run/zstack-ovn
+            - name: host-netns
+              mountPath: /var/run/netns
+              mountPropagation: HostToContainer
+            {{- if .Values.ovn.ssl.enabled }}
+            - name: ovn-ssl
+              mountPath: /etc/ovn/ssl
+              readOnly: true
+            {{- end }}
+
+        # OVN Controller container
+        - name: ovn-controller
+          image: {{ include "zstack-ovn-kubernetes.ovnImage" . }}
+          imagePullPolicy: {{ .Values.ovn.standalone.image.pullPolicy }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -ex
+              echo "Starting OVN controller..."
+              exec ovn-controller \
+                -vconsole:info \
+                --pidfile=/var/run/ovn/ovn-controller.pid \
+                --no-chdir \
+                unix:/var/run/openvswitch/db.sock
+          securityContext:
+            privileged: true
+            capabilities:
+              add:
+                - NET_ADMIN
+                - SYS_ADMIN
+          livenessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - pgrep -f ovn-controller > /dev/null
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: host-var-run-ovs
+              mountPath: /var/run/openvswitch
+            - name: host-var-run-ovn
+              mountPath: /var/run/ovn
+            - name: host-ovs-db
+              mountPath: /etc/openvswitch
+            - name: host-var-log-ovn
+              mountPath: /var/log/ovn
+
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "zstack-ovn-kubernetes.fullname" . }}-config
+        - name: cni-bin
+          hostPath:
+            path: /opt/cni/bin
+            type: DirectoryOrCreate
+        - name: cni-conf
+          hostPath:
+            path: /etc/cni/net.d
+            type: DirectoryOrCreate
+        - name: host-var-run-ovs
+          hostPath:
+            path: /var/run/openvswitch
+            type: DirectoryOrCreate
+        - name: host-var-run-ovn
+          hostPath:
+            path: /var/run/ovn
+            type: DirectoryOrCreate
+        - name: host-var-run-zstack-ovn
+          hostPath:
+            path: /var/run/zstack-ovn
+            type: DirectoryOrCreate
+        - name: host-ovs-db
+          hostPath:
+            path: /etc/openvswitch
+            type: DirectoryOrCreate
+        - name: host-var-log-ovn
+          hostPath:
+            path: /var/log/ovn
+            type: DirectoryOrCreate
+        - name: host-netns
+          hostPath:
+            path: /var/run/netns
+            type: DirectoryOrCreate
+        {{- if .Values.ovn.ssl.enabled }}
+        - name: ovn-ssl
+          secret:
+            secretName: {{ include "zstack-ovn-kubernetes.fullname" . }}-ovn-ssl
+        {{- end }}

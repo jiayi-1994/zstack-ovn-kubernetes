@@ -1,0 +1,38 @@
+# Kustomization for OVN Standalone Single-Node Deployment
+# This configuration deploys OVN components in single-instance mode
+# Suitable for development, testing, and small-scale deployments
+#
+# Usage:
+#   kubectl apply -k deploy/standalone/single/
+#
+# Components deployed:
+#   - OVN Northbound Database (single instance)
+#   - OVN Southbound Database (single instance)
+#   - OVN northd (single replica)
+#   - OVN controller (DaemonSet on all nodes)
+#
+# Prerequisites:
+#   - Kubernetes cluster with OVS installed on all nodes
+#   - openvswitch-switch package installed and running
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: ovn-kubernetes
+
+resources:
+  - namespace.yaml
+  - ovn-nb-db.yaml
+  - ovn-sb-db.yaml
+  - ovn-northd.yaml
+  - ovn-controller.yaml
+
+# Common labels for all resources
+commonLabels:
+  app.kubernetes.io/part-of: zstack-ovn-kubernetes
+  app.kubernetes.io/managed-by: kustomize
+  deployment-mode: standalone-single
+
+# Image customization (can be overridden)
+images:
+  - name: ghcr.io/ovn-org/ovn-kubernetes/ovn-kube-ubuntu
+    newTag: master

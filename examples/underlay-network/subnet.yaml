@@ -1,0 +1,84 @@
+# Example: Underlay Network Subnet
+#
+# 此示例创建一个 Underlay 网络子网，Pod 直接使用物理网络 IP。
+# Underlay 网络通过 VLAN 连接到物理网络，无需隧道封装。
+#
+# 前置条件:
+#   1. 节点上配置了 Provider Network
+#   2. 物理交换机配置了对应的 VLAN
+#
+# 使用方法:
+#   kubectl apply -f subnet.yaml
+#
+# 验证:
+#   kubectl get subnet underlay-subnet -o wide
+
+apiVersion: network.zstack.io/v1
+kind: Subnet
+metadata:
+  name: underlay-subnet
+  labels:
+    network-type: underlay
+spec:
+  # 物理网络 IP 范围
+  # 必须与物理网络规划一致
+  cidr: "192.168.100.0/24"
+  
+  # 物理网络网关
+  gateway: "192.168.100.1"
+  
+  # 排除的 IP 地址
+  # 包括网关、DHCP 服务器、已使用的 IP 等
+  excludeIPs:
+    - "192.168.100.1"                # 网关
+    - "192.168.100.2"                # DHCP 服务器
+    - "192.168.100.200-192.168.100.254"  # DHCP 范围
+  
+  # VLAN ID
+  # 必须与物理交换机配置一致
+  vlanID: 100
+  
+  # Provider Network 名称
+  # 对应节点上配置的物理网络提供者
+  provider: "provider-net1"
+  
+  protocol: IPv4
+
+---
+# Example: 多 VLAN 配置
+# 不同 VLAN 用于不同网络隔离
+
+apiVersion: network.zstack.io/v1
+kind: Subnet
+metadata:
+  name: management-subnet
+  labels:
+    network-type: underlay
+    purpose: management
+spec:
+  cidr: "192.168.10.0/24"
+  gateway: "192.168.10.1"
+  excludeIPs:
+    - "192.168.10.1"
+    - "192.168.10.200-192.168.10.254"
+  vlanID: 10
+  provider: "provider-net1"
+  protocol: IPv4
+
+---
+apiVersion: network.zstack.io/v1
+kind: Subnet
+metadata:
+  name: storage-subnet
+  labels:
+    network-type: underlay
+    purpose: storage
+spec:
+  cidr: "192.168.20.0/24"
+  gateway: "192.168.20.1"
+  excludeIPs:
+    - "192.168.20.1"
+    - "192.168.20.200-192.168.20.254"
+  vlanID: 20
+  provider: "provider-net1"
+  protocol: IPv4

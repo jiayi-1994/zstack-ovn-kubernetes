@@ -1,0 +1,8 @@
+# Namespace for zstack-ovn-kubernetes components
+# All CNI components will be deployed in this namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Release.Namespace }}
+  labels:
+    {{- include "zstack-ovn-kubernetes.labels" . | nindent 4 }}

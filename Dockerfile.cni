@@ -1,0 +1,177 @@
+# Dockerfile.cni
+# Multi-stage Dockerfile for zstack-ovn-cni
+#
+# This Dockerfile builds a minimal image containing only the CNI plugin binary.
+# It is designed to be used as an init container that copies the CNI binary
+# and configuration to the host node.
+#
+# The init container pattern:
+# 1. Init container runs before the main node agent container
+# 2. Copies CNI binary from /opt/cni/bin/zstack-ovn-cni to host's /opt/cni/bin/
+# 3. Copies CNI config from /etc/cni/net.d/ to host's /etc/cni/net.d/
+# 4. Exits after copying, main container starts
+#
+# This approach ensures:
+# - CNI binary is available before any Pods are scheduled
+# - CNI configuration is properly installed
+# - Clean separation between CNI installation and node agent
+#
+# Build arguments:
+#   TARGETOS    - Target operating system (default: linux)
+#   TARGETARCH  - Target architecture (amd64, arm64)
+#   VERSION     - Version string for the binary
+#   GIT_COMMIT  - Git commit hash
+#   BUILD_DATE  - Build timestamp
+#
+# Usage:
+#   # Build for current architecture
+#   docker build -t ghcr.io/jiayi-1994/zstack-ovn-cni:latest -f Dockerfile.cni .
+#
+#   # Build for multiple architectures
+#   docker buildx build --platform linux/amd64,linux/arm64 -t ghcr.io/jiayi-1994/zstack-ovn-cni:latest -f Dockerfile.cni .
+#
+# Kubernetes init container example:
+#   initContainers:
+#   - name: install-cni
+#     image: ghcr.io/jiayi-1994/zstack-ovn-cni:latest
+#     command: ["/install-cni.sh"]
+#     volumeMounts:
+#     - name: cni-bin
+#       mountPath: /host/opt/cni/bin
+#     - name: cni-conf
+#       mountPath: /host/etc/cni/net.d
+
+# ============================================================================
+# Stage 1: Build stage
+# Uses official Go image for compilation
+# ============================================================================
+FROM --platform=$BUILDPLATFORM golang:1.21-alpine AS builder
+
+# Build arguments for cross-compilation
+ARG TARGETOS=linux
+ARG TARGETARCH
+ARG VERSION=dev
+ARG GIT_COMMIT=unknown
+ARG BUILD_DATE=unknown
+
+# Install build dependencies
+RUN apk add --no-cache git ca-certificates
+
+# Set working directory
+WORKDIR /workspace
+
+# Copy go mod files first for better layer caching
+COPY go.mod go.sum ./
+
+# Download dependencies
+RUN go mod download
+
+# Copy source code
+COPY . .
+
+# Build the CNI binary
+# CGO_ENABLED=0: Build static binary (important for CNI plugins)
+# Static binaries work across different Linux distributions
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
+    -ldflags="-s -w \
+        -X main.version=${VERSION} \
+        -X main.gitCommit=${GIT_COMMIT} \
+        -X main.buildDate=${BUILD_DATE}" \
+    -trimpath \
+    -o zstack-ovn-cni \
+    ./cmd/zstack-ovn-cni
+
+# ============================================================================
+# Stage 2: Runtime stage
+# Uses minimal distroless image for smallest footprint
+# ============================================================================
+FROM gcr.io/distroless/static:nonroot AS distroless
+
+# This stage is for reference - we use Alpine below for the install script
+
+# ============================================================================
+# Stage 3: Final stage with install script
+# Uses Alpine for shell support (needed for install script)
+# ============================================================================
+FROM alpine:3.19
+
+# Labels for container metadata
+LABEL maintainer="ZStack <support@zstack.io>"
+LABEL description="ZStack OVN CNI Plugin - Init container for CNI installation"
+LABEL org.opencontainers.image.source="https://github.com/jiayi-1994/zstack-ovn-kubernetes"
+LABEL org.opencontainers.image.title="zstack-ovn-cni"
+LABEL org.opencontainers.image.description="CNI plugin binary and installation script for Kubernetes networking"
+
+# Create directories
+RUN mkdir -p /opt/cni/bin /etc/cni/net.d
+
+# Copy CNI binary from builder
+COPY --from=builder /workspace/zstack-ovn-cni /opt/cni/bin/
+
+# Set permissions
+RUN chmod +x /opt/cni/bin/zstack-ovn-cni
+
+# Create CNI configuration template
+# This is a basic configuration that will be customized at runtime
+RUN cat > /etc/cni/net.d/10-zstack-ovn.conflist << 'EOF'
+{
+  "cniVersion": "1.0.0",
+  "name": "zstack-ovn",
+  "plugins": [
+    {
+      "type": "zstack-ovn-cni",
+      "serverSocket": "/var/run/zstack-ovn/cni-server.sock",
+      "logFile": "/var/log/zstack-ovn/cni.log",
+      "logLevel": "info"
+    }
+  ]
+}
+EOF
+
+# Create install script
+# This script is run by the init container to install CNI binary and config
+RUN cat > /install-cni.sh << 'EOF'
+#!/bin/sh
+set -e
+
+echo "Installing ZStack OVN CNI plugin..."
+
+# Install CNI binary
+if [ -d "/host/opt/cni/bin" ]; then
+    echo "Copying CNI binary to /host/opt/cni/bin/"
+    cp -f /opt/cni/bin/zstack-ovn-cni /host/opt/cni/bin/
+    chmod +x /host/opt/cni/bin/zstack-ovn-cni
+    echo "CNI binary installed successfully"
+else
+    echo "Warning: /host/opt/cni/bin not mounted, skipping binary installation"
+fi
+
+# Install CNI configuration
+# Only install if no existing configuration and host directory is mounted
+if [ -d "/host/etc/cni/net.d" ]; then
+    # Check if configuration already exists
+    if [ ! -f "/host/etc/cni/net.d/10-zstack-ovn.conflist" ]; then
+        echo "Copying CNI configuration to /host/etc/cni/net.d/"
+        cp -f /etc/cni/net.d/10-zstack-ovn.conflist /host/etc/cni/net.d/
+        echo "CNI configuration installed successfully"
+    else
+        echo "CNI configuration already exists, skipping"
+    fi
+else
+    echo "Warning: /host/etc/cni/net.d not mounted, skipping config installation"
+fi
+
+echo "ZStack OVN CNI installation complete"
+
+# If SLEEP_AFTER_INSTALL is set, sleep to keep container running
+# This is useful for debugging
+if [ -n "$SLEEP_AFTER_INSTALL" ]; then
+    echo "Sleeping for $SLEEP_AFTER_INSTALL seconds..."
+    sleep "$SLEEP_AFTER_INSTALL"
+fi
+EOF
+
+RUN chmod +x /install-cni.sh
+
+# Default entrypoint runs the install script
+ENTRYPOINT ["/install-cni.sh"]

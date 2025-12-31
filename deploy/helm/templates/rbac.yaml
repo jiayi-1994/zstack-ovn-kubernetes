@@ -1,0 +1,145 @@
+# RBAC configuration for zstack-ovn-kubernetes
+# Defines ServiceAccounts, ClusterRoles, and ClusterRoleBindings
+# for controller and node agent components
+---
+# ServiceAccount for Controller
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "zstack-ovn-kubernetes.controller.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zstack-ovn-kubernetes.controller.labels" . | nindent 4 }}
+---
+# ServiceAccount for Node Agent
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "zstack-ovn-kubernetes.node.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zstack-ovn-kubernetes.node.labels" . | nindent 4 }}
+---
+# ClusterRole for Controller
+# Controller needs broad permissions to manage network resources
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "zstack-ovn-kubernetes.fullname" . }}-controller
+  labels:
+    {{- include "zstack-ovn-kubernetes.controller.labels" . | nindent 4 }}
+rules:
+  # Core resources
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["pods/status"]
+    verbs: ["update", "patch"]
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["nodes/status"]
+    verbs: ["update", "patch"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["endpoints"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  
+  # Discovery API for EndpointSlices
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  
+  # NetworkPolicy
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch"]
+  
+  # Custom Subnet CRD
+  - apiGroups: ["network.zstack.io"]
+    resources: ["subnets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["network.zstack.io"]
+    resources: ["subnets/status"]
+    verbs: ["get", "update", "patch"]
+  
+  # Leader election
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+# ClusterRole for Node Agent
+# Node agent needs permissions to manage local node resources
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "zstack-ovn-kubernetes.fullname" . }}-node
+  labels:
+    {{- include "zstack-ovn-kubernetes.node.labels" . | nindent 4 }}
+rules:
+  # Core resources
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["nodes/status"]
+    verbs: ["update", "patch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch", "update"]
+  
+  # Custom Subnet CRD
+  - apiGroups: ["network.zstack.io"]
+    resources: ["subnets"]
+    verbs: ["get", "list", "watch"]
+---
+# ClusterRoleBinding for Controller
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "zstack-ovn-kubernetes.fullname" . }}-controller
+  labels:
+    {{- include "zstack-ovn-kubernetes.controller.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "zstack-ovn-kubernetes.fullname" . }}-controller
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "zstack-ovn-kubernetes.controller.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+# ClusterRoleBinding for Node Agent
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "zstack-ovn-kubernetes.fullname" . }}-node
+  labels:
+    {{- include "zstack-ovn-kubernetes.node.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "zstack-ovn-kubernetes.fullname" . }}-node
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "zstack-ovn-kubernetes.node.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}

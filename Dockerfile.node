@@ -1,0 +1,155 @@
+# Dockerfile.node
+# Multi-stage Dockerfile for zstack-ovnkube-node
+#
+# This Dockerfile builds the node agent component that:
+# - Runs as a DaemonSet on each Kubernetes node
+# - Starts the CNI Server (Unix Socket) to handle CNI requests
+# - Configures local OVS bridges and ports
+# - Manages node-level networking (gateway, tunnels)
+# - Includes the CNI binary for installation
+#
+# The image includes:
+# - zstack-ovnkube-node: Node agent binary
+# - zstack-ovn-cni: CNI plugin binary (copied to host via init container or volume mount)
+# - OVS/OVN utilities for network configuration
+#
+# Build arguments:
+#   TARGETOS    - Target operating system (default: linux)
+#   TARGETARCH  - Target architecture (amd64, arm64)
+#   VERSION     - Version string for the binary
+#   GIT_COMMIT  - Git commit hash
+#   BUILD_DATE  - Build timestamp
+#
+# Usage:
+#   # Build for current architecture
+#   docker build -t ghcr.io/jiayi-1994/zstack-ovnkube-node:latest -f Dockerfile.node .
+#
+#   # Build for specific architecture
+#   docker buildx build --platform linux/amd64,linux/arm64 -t ghcr.io/jiayi-1994/zstack-ovnkube-node:latest -f Dockerfile.node .
+
+# ============================================================================
+# Stage 1: Build stage
+# Uses official Go image for compilation
+# ============================================================================
+FROM --platform=$BUILDPLATFORM golang:1.21-alpine AS builder
+
+# Build arguments for cross-compilation
+ARG TARGETOS=linux
+ARG TARGETARCH
+ARG VERSION=dev
+ARG GIT_COMMIT=unknown
+ARG BUILD_DATE=unknown
+
+# Install build dependencies
+RUN apk add --no-cache git ca-certificates
+
+# Set working directory
+WORKDIR /workspace
+
+# Copy go mod files first for better layer caching
+COPY go.mod go.sum ./
+
+# Download dependencies
+RUN go mod download
+
+# Copy source code
+COPY . .
+
+# Build the node agent binary
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
+    -ldflags="-s -w \
+        -X main.version=${VERSION} \
+        -X main.gitCommit=${GIT_COMMIT} \
+        -X main.buildDate=${BUILD_DATE}" \
+    -trimpath \
+    -o zstack-ovnkube-node \
+    ./cmd/zstack-ovnkube-node
+
+# Build the CNI binary
+# The CNI binary is included in the node image for convenience
+# It can be copied to the host's /opt/cni/bin/ directory
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
+    -ldflags="-s -w \
+        -X main.version=${VERSION} \
+        -X main.gitCommit=${GIT_COMMIT} \
+        -X main.buildDate=${BUILD_DATE}" \
+    -trimpath \
+    -o zstack-ovn-cni \
+    ./cmd/zstack-ovn-cni
+
+# ============================================================================
+# Stage 2: Runtime stage
+# Uses Alpine with OVS/OVN tools for network configuration
+# ============================================================================
+FROM alpine:3.19
+
+# Labels for container metadata
+LABEL maintainer="ZStack <support@zstack.io>"
+LABEL description="ZStack OVN Kubernetes Node Agent - Node-level networking component"
+LABEL org.opencontainers.image.source="https://github.com/jiayi-1994/zstack-ovn-kubernetes"
+LABEL org.opencontainers.image.title="zstack-ovnkube-node"
+LABEL org.opencontainers.image.description="Node agent that manages local OVS/OVN configuration and CNI server"
+
+# Install runtime dependencies
+# - ca-certificates: Required for HTTPS connections
+# - tzdata: Timezone data
+# - openvswitch: OVS utilities (ovs-vsctl, ovs-ofctl, etc.)
+# - iproute2: Network utilities (ip, bridge, etc.)
+# - iptables: Firewall rules for gateway
+# - bash: For scripts
+# - jq: JSON processing for debugging
+RUN apk add --no-cache \
+    ca-certificates \
+    tzdata \
+    openvswitch \
+    iproute2 \
+    iptables \
+    bash \
+    jq
+
+# Create directories for CNI
+# /opt/cni/bin: CNI plugin binaries
+# /etc/cni/net.d: CNI configuration files
+# /var/run/zstack-ovn: Runtime files (CNI server socket)
+# /var/log/zstack-ovn: Log files
+RUN mkdir -p /opt/cni/bin \
+    && mkdir -p /etc/cni/net.d \
+    && mkdir -p /var/run/zstack-ovn \
+    && mkdir -p /var/log/zstack-ovn
+
+# Copy binaries from builder stage
+COPY --from=builder /workspace/zstack-ovnkube-node /usr/local/bin/
+COPY --from=builder /workspace/zstack-ovn-cni /opt/cni/bin/
+
+# Set permissions
+RUN chmod +x /usr/local/bin/zstack-ovnkube-node \
+    && chmod +x /opt/cni/bin/zstack-ovn-cni
+
+# Copy CNI configuration template
+# This will be customized at runtime based on configuration
+COPY deploy/yaml/cni-config.json /etc/cni/net.d/10-zstack-ovn.conflist.template
+
+# Copy entrypoint script
+COPY scripts/node-entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh || true
+
+# Note: Node agent runs as root because it needs to:
+# - Configure OVS bridges and ports
+# - Create network namespaces
+# - Modify iptables rules
+# - Access host network namespace
+
+# Expose ports
+# 8082: Metrics endpoint (Prometheus)
+# 8083: Health probe endpoint (liveness/readiness)
+EXPOSE 8082 8083
+
+# Set entrypoint
+# The entrypoint script handles:
+# 1. Installing CNI binary to host
+# 2. Installing CNI configuration to host
+# 3. Starting the node agent
+ENTRYPOINT ["/usr/local/bin/zstack-ovnkube-node"]
+
+# Default command arguments
+CMD ["--metrics-bind-address=:8082", "--health-probe-bind-address=:8083"]

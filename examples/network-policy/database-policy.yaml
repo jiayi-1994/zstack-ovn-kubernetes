@@ -1,0 +1,147 @@
+# Database Access Control Policy
+#
+# 此策略实现数据库的严格访问控制。
+# 只允许特定的应用 Pod 访问数据库。
+#
+# 使用方法:
+#   kubectl apply -f database-policy.yaml
+
+# MySQL 数据库访问策略
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mysql-access-policy
+  namespace: database
+spec:
+  # 选择 MySQL Pod
+  podSelector:
+    matchLabels:
+      app: mysql
+      tier: database
+  
+  policyTypes:
+  - Ingress
+  - Egress
+  
+  ingress:
+  # 只允许 API 服务访问
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: production
+      podSelector:
+        matchLabels:
+          app: api
+          tier: backend
+    ports:
+    - protocol: TCP
+      port: 3306
+  
+  # 允许数据库管理工具访问
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: admin-tools
+      podSelector:
+        matchLabels:
+          app: mysql-admin
+    ports:
+    - protocol: TCP
+      port: 3306
+  
+  egress:
+  # 允许 DNS 查询
+  - to:
+    - namespaceSelector: {}
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53
+  
+  # 允许主从复制
+  - to:
+    - podSelector:
+        matchLabels:
+          app: mysql
+          tier: database
+    ports:
+    - protocol: TCP
+      port: 3306
+
+---
+# PostgreSQL 数据库访问策略
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-access-policy
+  namespace: database
+spec:
+  podSelector:
+    matchLabels:
+      app: postgresql
+  
+  policyTypes:
+  - Ingress
+  
+  ingress:
+  # 允许应用访问
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          environment: production
+      podSelector:
+        matchLabels:
+          database-access: "true"
+    ports:
+    - protocol: TCP
+      port: 5432
+  
+  # 允许备份服务访问
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: backup
+      podSelector:
+        matchLabels:
+          app: pg-backup
+    ports:
+    - protocol: TCP
+      port: 5432
+
+---
+# Redis 缓存访问策略
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis-access-policy
+  namespace: cache
+spec:
+  podSelector:
+    matchLabels:
+      app: redis
+  
+  policyTypes:
+  - Ingress
+  
+  ingress:
+  # 允许所有应用命名空间访问
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          redis-access: "true"
+    ports:
+    - protocol: TCP
+      port: 6379
+  
+  # 允许 Redis Sentinel 通信
+  - from:
+    - podSelector:
+        matchLabels:
+          app: redis-sentinel
+    ports:
+    - protocol: TCP
+      port: 6379
+    - protocol: TCP
+      port: 26379

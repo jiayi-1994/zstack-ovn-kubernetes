@@ -1,0 +1,62 @@
+# .dockerignore
+# Exclude files and directories from Docker build context
+# This reduces build time and image size
+
+# Git
+.git
+.gitignore
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Build artifacts
+bin/
+dist/
+coverage.out
+*.test
+*.out
+
+# Documentation (not needed in image)
+docs/
+*.md
+!README.md
+
+# Test files (not needed in production image)
+test/
+*_test.go
+*.test
+
+# Examples (not needed in image)
+examples/
+
+# Local development files
+.env
+.env.local
+*.local
+
+# Kubernetes manifests (not needed in image, except for CNI config)
+deploy/helm/
+deploy/standalone/
+deploy/yaml/*.yaml
+!deploy/yaml/cni-config.json
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Vendor directory (if using vendoring, uncomment to include)
+# vendor/

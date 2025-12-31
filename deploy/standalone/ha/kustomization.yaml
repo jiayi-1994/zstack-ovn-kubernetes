@@ -1,0 +1,39 @@
+# Kustomization for OVN Standalone High Availability Deployment
+# This configuration deploys OVN components in HA mode with Raft clustering
+# Suitable for production deployments requiring fault tolerance
+#
+# Usage:
+#   kubectl apply -k deploy/standalone/ha/
+#
+# Components deployed:
+#   - OVN Northbound Database (3-node Raft cluster)
+#   - OVN Southbound Database (3-node Raft cluster)
+#   - OVN northd (2 replicas with leader election)
+#   - OVN controller (DaemonSet on all nodes)
+#
+# Prerequisites:
+#   - Kubernetes cluster with at least 3 nodes (for proper Raft distribution)
+#   - OVS installed on all nodes
+#   - StorageClass available for PersistentVolumeClaims
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: ovn-kubernetes
+
+resources:
+  - namespace.yaml
+  - ovn-nb-db.yaml
+  - ovn-sb-db.yaml
+  - ovn-northd.yaml
+  - ovn-controller.yaml
+
+# Common labels for all resources
+commonLabels:
+  app.kubernetes.io/part-of: zstack-ovn-kubernetes
+  app.kubernetes.io/managed-by: kustomize
+  deployment-mode: standalone-ha
+
+# Image customization (can be overridden)
+images:
+  - name: ghcr.io/ovn-org/ovn-kubernetes/ovn-kube-ubuntu
+    newTag: master

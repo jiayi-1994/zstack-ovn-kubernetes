@@ -1,0 +1,71 @@
+# ConfigMap for zstack-ovn-kubernetes configuration
+# Contains CNI configuration and controller settings
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "zstack-ovn-kubernetes.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zstack-ovn-kubernetes.labels" . | nindent 4 }}
+data:
+  # CNI configuration file
+  # This will be installed to /etc/cni/net.d/10-zstack-ovn.conflist
+  cni-conf.json: |
+    {
+      "cniVersion": "0.4.0",
+      "name": "zstack-ovn-kubernetes",
+      "plugins": [
+        {
+          "type": "zstack-ovn-cni",
+          "logLevel": "{{ .Values.logging.level }}",
+          "logFormat": "{{ .Values.logging.format }}",
+          "socketPath": "/var/run/zstack-ovn/cni-server.sock"
+        }
+      ]
+    }
+
+  # Controller configuration
+  config.yaml: |
+    # OVN Configuration
+    ovn:
+      mode: {{ .Values.ovn.mode }}
+      nbdbAddress: {{ include "zstack-ovn-kubernetes.nbdbAddress" . | quote }}
+      sbdbAddress: {{ include "zstack-ovn-kubernetes.sbdbAddress" . | quote }}
+      ssl:
+        enabled: {{ .Values.ovn.ssl.enabled }}
+        {{- if .Values.ovn.ssl.enabled }}
+        caCert: {{ .Values.ovn.ssl.caCert | quote }}
+        clientCert: {{ .Values.ovn.ssl.clientCert | quote }}
+        clientKey: {{ .Values.ovn.ssl.clientKey | quote }}
+        {{- end }}
+
+    # Network Configuration
+    network:
+      clusterCIDR: {{ .Values.network.clusterCIDR | quote }}
+      serviceCIDR: {{ .Values.network.serviceCIDR | quote }}
+      nodeSubnetSize: {{ .Values.network.nodeSubnetSize }}
+
+    # Gateway Configuration
+    gateway:
+      mode: {{ .Values.gateway.mode | quote }}
+      {{- if .Values.gateway.interface }}
+      interface: {{ .Values.gateway.interface | quote }}
+      {{- end }}
+
+    # Tunnel Configuration
+    tunnel:
+      type: {{ .Values.tunnel.type | quote }}
+      port: {{ .Values.tunnel.port }}
+
+    # DPDK Configuration
+    dpdk:
+      enabled: {{ .Values.dpdk.enabled }}
+      {{- if .Values.dpdk.enabled }}
+      socketDir: {{ .Values.dpdk.socketDir | quote }}
+      {{- end }}
+
+    # Logging Configuration
+    logging:
+      level: {{ .Values.logging.level | quote }}
+      format: {{ .Values.logging.format | quote }}

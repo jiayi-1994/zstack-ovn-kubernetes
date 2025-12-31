@@ -1,0 +1,12 @@
+{
+  "cniVersion": "1.0.0",
+  "name": "zstack-ovn",
+  "plugins": [
+    {
+      "type": "zstack-ovn-cni",
+      "serverSocket": "/var/run/zstack-ovn/cni-server.sock",
+      "logFile": "/var/log/zstack-ovn/cni.log",
+      "logLevel": "info"
+    }
+  ]
+}

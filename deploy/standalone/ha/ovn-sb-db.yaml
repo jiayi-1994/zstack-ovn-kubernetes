@@ -1,0 +1,214 @@
+# OVN Southbound Database - High Availability Mode (3-node Raft Cluster)
+# The SB DB stores logical flow tables and chassis bindings
+# In HA mode, we use a 3-node Raft cluster for fault tolerance
+#
+# Raft Cluster:
+# - 3 replicas provide tolerance for 1 node failure
+# - Leader election is automatic
+# - Data is replicated across all nodes
+#
+# Reference: OVN-Kubernetes HA deployment patterns
+# Image: Official OVN-Kubernetes image from ghcr.io
+---
+# Headless Service for Raft cluster discovery
+apiVersion: v1
+kind: Service
+metadata:
+  name: ovn-sb-db-headless
+  namespace: ovn-kubernetes
+  labels:
+    app.kubernetes.io/name: ovn-sb-db
+    app.kubernetes.io/component: database
+spec:
+  type: ClusterIP
+  clusterIP: None  # Headless service for StatefulSet
+  ports:
+    - name: sb-db
+      port: 6642
+      targetPort: 6642
+      protocol: TCP
+    - name: sb-db-raft
+      port: 6644
+      targetPort: 6644
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: ovn-sb-db
+---
+# ClusterIP Service for client connections
+apiVersion: v1
+kind: Service
+metadata:
+  name: ovn-sb-db
+  namespace: ovn-kubernetes
+  labels:
+    app.kubernetes.io/name: ovn-sb-db
+    app.kubernetes.io/component: database
+spec:
+  type: ClusterIP
+  ports:
+    - name: sb-db
+      port: 6642
+      targetPort: 6642
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: ovn-sb-db
+
+---
+# StatefulSet for SB DB Raft cluster
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ovn-sb-db
+  namespace: ovn-kubernetes
+  labels:
+    app.kubernetes.io/name: ovn-sb-db
+    app.kubernetes.io/component: database
+spec:
+  serviceName: ovn-sb-db-headless
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ovn-sb-db
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ovn-sb-db
+        app.kubernetes.io/component: database
+    spec:
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: ovn-sb-db
+                topologyKey: kubernetes.io/hostname
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 50
+              preference:
+                matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: Exists
+
+      containers:
+        - name: ovn-sb-db
+          image: ghcr.io/ovn-org/ovn-kubernetes/ovn-kube-ubuntu:master
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -ex
+              
+              # Get pod identity from hostname
+              POD_NAME=$(hostname)
+              POD_INDEX=${POD_NAME##*-}
+              
+              # Define cluster members
+              CLUSTER_SIZE=3
+              SERVICE_NAME="ovn-sb-db-headless"
+              NAMESPACE="ovn-kubernetes"
+              DOMAIN="${SERVICE_NAME}.${NAMESPACE}.svc.cluster.local"
+              
+              # Build cluster member list for Raft
+              CLUSTER_MEMBERS=""
+              for i in $(seq 0 $((CLUSTER_SIZE - 1))); do
+                if [ -n "$CLUSTER_MEMBERS" ]; then
+                  CLUSTER_MEMBERS="${CLUSTER_MEMBERS},"
+                fi
+                CLUSTER_MEMBERS="${CLUSTER_MEMBERS}tcp:ovn-sb-db-${i}.${DOMAIN}:6644"
+              done
+              
+              MY_ADDRESS="tcp:${POD_NAME}.${DOMAIN}:6644"
+              DB_FILE="/var/lib/ovn/ovnsb_db.db"
+              
+              echo "Pod: ${POD_NAME}, Index: ${POD_INDEX}"
+              echo "My Address: ${MY_ADDRESS}"
+              echo "Cluster Members: ${CLUSTER_MEMBERS}"
+              
+              # Initialize or join Raft cluster
+              if [ ! -f "${DB_FILE}" ]; then
+                if [ "${POD_INDEX}" == "0" ]; then
+                  echo "Initializing new Raft cluster as leader..."
+                  ovsdb-tool create-cluster "${DB_FILE}" /usr/share/ovn/ovn-sb.ovsschema "${MY_ADDRESS}"
+                else
+                  echo "Joining existing Raft cluster..."
+                  sleep 5
+                  LEADER_ADDRESS="tcp:ovn-sb-db-0.${DOMAIN}:6644"
+                  ovsdb-tool join-cluster "${DB_FILE}" OVN_Southbound "${MY_ADDRESS}" "${LEADER_ADDRESS}"
+                fi
+              fi
+              
+              # Start OVSDB server in Raft mode
+              exec ovsdb-server "${DB_FILE}" \
+                --remote=ptcp:6642:0.0.0.0 \
+                --remote=ptcp:6644:0.0.0.0 \
+                --pidfile=/var/run/ovn/ovnsb_db.pid \
+                --log-file=/var/log/ovn/ovnsb_db.log \
+                --no-chdir \
+                -vconsole:info
+          ports:
+            - name: sb-db
+              containerPort: 6642
+              protocol: TCP
+            - name: sb-db-raft
+              containerPort: 6644
+              protocol: TCP
+          volumeMounts:
+            - name: ovn-data
+              mountPath: /var/lib/ovn
+            - name: ovn-run
+              mountPath: /var/run/ovn
+            - name: ovn-log
+              mountPath: /var/log/ovn
+          livenessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  ovsdb-client list-dbs tcp:127.0.0.1:6642 | grep -q OVN_Southbound
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  ovsdb-client list-dbs tcp:127.0.0.1:6642 | grep -q OVN_Southbound
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+      volumes:
+        - name: ovn-run
+          emptyDir: {}
+        - name: ovn-log
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: ovn-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

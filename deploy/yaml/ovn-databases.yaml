@@ -1,0 +1,375 @@
+# OVN Database Components for Standalone Mode
+# This file contains the OVN NB DB, SB DB, and northd deployments
+# Only needed when running in standalone mode (not connecting to external ZStack OVN)
+#
+# For external mode (ZStack integration), skip this file and configure
+# the external OVN database addresses in the configmap.
+---
+# OVN Northbound Database Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: ovn-nb-db
+  namespace: zstack-ovn-kubernetes
+  labels:
+    app.kubernetes.io/name: zstack-ovn-kubernetes
+    app.kubernetes.io/component: ovn-nb-db
+spec:
+  type: ClusterIP
+  ports:
+    - name: nb-db
+      port: 6641
+      targetPort: 6641
+      protocol: TCP
+    - name: nb-db-raft
+      port: 6643
+      targetPort: 6643
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: zstack-ovn-kubernetes
+    app.kubernetes.io/component: ovn-nb-db
+---
+# OVN Northbound Database Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ovn-nb-db
+  namespace: zstack-ovn-kubernetes
+  labels:
+    app.kubernetes.io/name: zstack-ovn-kubernetes
+    app.kubernetes.io/component: ovn-nb-db
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: zstack-ovn-kubernetes
+      app.kubernetes.io/component: ovn-nb-db
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: zstack-ovn-kubernetes
+        app.kubernetes.io/component: ovn-nb-db
+    spec:
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: Exists
+      containers:
+        - name: ovn-nb-db
+          image: ghcr.io/ovn-org/ovn-kubernetes/ovn-kube-ubuntu:master
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -ex
+              if [ ! -f /var/lib/ovn/ovnnb_db.db ]; then
+                echo "Initializing OVN Northbound Database..."
+                ovsdb-tool create /var/lib/ovn/ovnnb_db.db /usr/share/ovn/ovn-nb.ovsschema
+              fi
+              
+              exec /usr/share/ovn/scripts/ovn-ctl run_nb_ovsdb \
+                --db-nb-addr=0.0.0.0 \
+                --db-nb-port=6641 \
+                --db-nb-create-insecure-remote=yes \
+                --ovn-nb-db-ssl-key= \
+                --ovn-nb-db-ssl-cert= \
+                --ovn-nb-db-ssl-ca-cert=
+          ports:
+            - name: nb-db
+              containerPort: 6641
+              protocol: TCP
+            - name: nb-db-raft
+              containerPort: 6643
+              protocol: TCP
+          volumeMounts:
+            - name: ovn-data
+              mountPath: /var/lib/ovn
+            - name: ovn-run
+              mountPath: /var/run/ovn
+          livenessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - ovsdb-client list-dbs tcp:127.0.0.1:6641 | grep -q OVN_Northbound
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - ovsdb-client list-dbs tcp:127.0.0.1:6641 | grep -q OVN_Northbound
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: ovn-data
+          emptyDir: {}
+        - name: ovn-run
+          emptyDir: {}
+---
+# OVN Southbound Database Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: ovn-sb-db
+  namespace: zstack-ovn-kubernetes
+  labels:
+    app.kubernetes.io/name: zstack-ovn-kubernetes
+    app.kubernetes.io/component: ovn-sb-db
+spec:
+  type: ClusterIP
+  ports:
+    - name: sb-db
+      port: 6642
+      targetPort: 6642
+      protocol: TCP
+    - name: sb-db-raft
+      port: 6644
+      targetPort: 6644
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: zstack-ovn-kubernetes
+    app.kubernetes.io/component: ovn-sb-db
+---
+# OVN Southbound Database Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ovn-sb-db
+  namespace: zstack-ovn-kubernetes
+  labels:
+    app.kubernetes.io/name: zstack-ovn-kubernetes
+    app.kubernetes.io/component: ovn-sb-db
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: zstack-ovn-kubernetes
+      app.kubernetes.io/component: ovn-sb-db
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: zstack-ovn-kubernetes
+        app.kubernetes.io/component: ovn-sb-db
+    spec:
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: Exists
+      containers:
+        - name: ovn-sb-db
+          image: ghcr.io/ovn-org/ovn-kubernetes/ovn-kube-ubuntu:master
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -ex
+              if [ ! -f /var/lib/ovn/ovnsb_db.db ]; then
+                echo "Initializing OVN Southbound Database..."
+                ovsdb-tool create /var/lib/ovn/ovnsb_db.db /usr/share/ovn/ovn-sb.ovsschema
+              fi
+              
+              exec /usr/share/ovn/scripts/ovn-ctl run_sb_ovsdb \
+                --db-sb-addr=0.0.0.0 \
+                --db-sb-port=6642 \
+                --db-sb-create-insecure-remote=yes \
+                --ovn-sb-db-ssl-key= \
+                --ovn-sb-db-ssl-cert= \
+                --ovn-sb-db-ssl-ca-cert=
+          ports:
+            - name: sb-db
+              containerPort: 6642
+              protocol: TCP
+            - name: sb-db-raft
+              containerPort: 6644
+              protocol: TCP
+          volumeMounts:
+            - name: ovn-data
+              mountPath: /var/lib/ovn
+            - name: ovn-run
+              mountPath: /var/run/ovn
+          livenessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - ovsdb-client list-dbs tcp:127.0.0.1:6642 | grep -q OVN_Southbound
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - ovsdb-client list-dbs tcp:127.0.0.1:6642 | grep -q OVN_Southbound
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: ovn-data
+          emptyDir: {}
+        - name: ovn-run
+          emptyDir: {}
+---
+# OVN Northd Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ovn-northd
+  namespace: zstack-ovn-kubernetes
+  labels:
+    app.kubernetes.io/name: zstack-ovn-kubernetes
+    app.kubernetes.io/component: ovn-northd
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: zstack-ovn-kubernetes
+      app.kubernetes.io/component: ovn-northd
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: zstack-ovn-kubernetes
+        app.kubernetes.io/component: ovn-northd
+    spec:
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: Exists
+
+      # Wait for NB and SB databases to be ready
+      initContainers:
+        - name: wait-for-dbs
+          image: ghcr.io/ovn-org/ovn-kubernetes/ovn-kube-ubuntu:master
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -ex
+              echo "Waiting for OVN NB DB to be ready..."
+              until ovsdb-client list-dbs tcp:ovn-nb-db.zstack-ovn-kubernetes.svc.cluster.local:6641 2>/dev/null | grep -q OVN_Northbound; do
+                echo "NB DB not ready, waiting..."
+                sleep 2
+              done
+              echo "NB DB is ready!"
+              
+              echo "Waiting for OVN SB DB to be ready..."
+              until ovsdb-client list-dbs tcp:ovn-sb-db.zstack-ovn-kubernetes.svc.cluster.local:6642 2>/dev/null | grep -q OVN_Southbound; do
+                echo "SB DB not ready, waiting..."
+                sleep 2
+              done
+              echo "SB DB is ready!"
+
+      containers:
+        - name: ovn-northd
+          image: ghcr.io/ovn-org/ovn-kubernetes/ovn-kube-ubuntu:master
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -ex
+              
+              OVN_NB_DB="tcp:ovn-nb-db.zstack-ovn-kubernetes.svc.cluster.local:6641"
+              OVN_SB_DB="tcp:ovn-sb-db.zstack-ovn-kubernetes.svc.cluster.local:6642"
+              
+              echo "Starting OVN northd..."
+              echo "NB DB: ${OVN_NB_DB}"
+              echo "SB DB: ${OVN_SB_DB}"
+              
+              exec ovn-northd \
+                --ovn-northd-nb-db="${OVN_NB_DB}" \
+                --ovn-northd-sb-db="${OVN_SB_DB}" \
+                -vconsole:info \
+                --pidfile=/var/run/ovn/ovn-northd.pid \
+                --no-chdir
+          env:
+            - name: OVN_NB_DB
+              value: "tcp:ovn-nb-db.zstack-ovn-kubernetes.svc.cluster.local:6641"
+            - name: OVN_SB_DB
+              value: "tcp:ovn-sb-db.zstack-ovn-kubernetes.svc.cluster.local:6642"
+          volumeMounts:
+            - name: ovn-run
+              mountPath: /var/run/ovn
+          livenessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - pgrep -f ovn-northd > /dev/null
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: ovn-run
+          emptyDir: {}

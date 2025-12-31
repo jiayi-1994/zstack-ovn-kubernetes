@@ -1,0 +1,17 @@
+apiVersion: v2
+name: zstack-ovn-kubernetes
+description: A Kubernetes CNI plugin based on OVN for ZStack IaaS platform
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - cni
+  - ovn
+  - networking
+  - zstack
+  - kubernetes
+maintainers:
+  - name: ZStack Team
+    email: support@zstack.io
+sources:
+  - https://github.com/jiayi-1994/zstack-ovn-kubernetes

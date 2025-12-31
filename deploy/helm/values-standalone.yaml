@@ -1,0 +1,79 @@
+# Values for standalone deployment mode
+# Use this when deploying zstack-ovn-kubernetes independently without ZStack
+
+ovn:
+  # Standalone mode: self-managed OVN databases
+  mode: standalone
+
+  # OVN databases will be deployed as part of this chart
+  # No external database addresses needed
+  nbdbAddress: ""
+  sbdbAddress: ""
+
+  # Standalone deployment configuration
+  standalone:
+    # High availability mode: "single" or "ha"
+    # - single: Single instance databases (dev/test)
+    # - ha: 3-node Raft cluster (production)
+    haMode: single
+
+    # Database image configuration
+    image:
+      repository: ghcr.io/ovn-org/ovn-kubernetes/ovn-kube-ubuntu
+      tag: master
+      pullPolicy: IfNotPresent
+
+    # NB DB configuration
+    nbdb:
+      # Number of replicas (1 for single, 3 for ha)
+      replicas: 1
+      # Storage configuration (only used in HA mode)
+      storage:
+        enabled: false
+        size: 1Gi
+        storageClass: ""
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+
+    # SB DB configuration
+    sbdb:
+      replicas: 1
+      storage:
+        enabled: false
+        size: 1Gi
+        storageClass: ""
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+
+    # northd configuration
+    northd:
+      replicas: 1
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+
+network:
+  clusterCIDR: "10.244.0.0/16"
+  serviceCIDR: "10.96.0.0/16"
+  nodeSubnetSize: 24
+
+gateway:
+  mode: local
+
+tunnel:
+  type: vxlan
+  port: 4789

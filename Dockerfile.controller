@@ -1,0 +1,115 @@
+# Dockerfile.controller
+# Multi-stage Dockerfile for zstack-ovnkube-controller
+#
+# This Dockerfile builds the controller component that:
+# - Watches Kubernetes resources (Pods, Services, NetworkPolicies, Nodes)
+# - Manages OVN logical objects (Logical Switches, Routers, Ports, Load Balancers, ACLs)
+# - Handles IP allocation for Pods
+# - Implements Kubernetes Service load balancing via OVN
+#
+# Build arguments:
+#   TARGETOS    - Target operating system (default: linux)
+#   TARGETARCH  - Target architecture (amd64, arm64)
+#   VERSION     - Version string for the binary
+#   GIT_COMMIT  - Git commit hash
+#   BUILD_DATE  - Build timestamp
+#
+# Usage:
+#   # Build for current architecture
+#   docker build -t ghcr.io/jiayi-1994/zstack-ovnkube-controller:latest -f Dockerfile.controller .
+#
+#   # Build for specific architecture
+#   docker buildx build --platform linux/amd64 -t ghcr.io/jiayi-1994/zstack-ovnkube-controller:latest -f Dockerfile.controller .
+#
+#   # Build with version info
+#   docker build --build-arg VERSION=1.0.0 --build-arg GIT_COMMIT=$(git rev-parse --short HEAD) \
+#     -t ghcr.io/jiayi-1994/zstack-ovnkube-controller:1.0.0 -f Dockerfile.controller .
+
+# ============================================================================
+# Stage 1: Build stage
+# Uses official Go image for compilation
+# ============================================================================
+FROM --platform=$BUILDPLATFORM golang:1.21-alpine AS builder
+
+# Build arguments for cross-compilation
+ARG TARGETOS=linux
+ARG TARGETARCH
+ARG VERSION=dev
+ARG GIT_COMMIT=unknown
+ARG BUILD_DATE=unknown
+
+# Install build dependencies
+# - git: for version information
+# - ca-certificates: for HTTPS connections during go mod download
+RUN apk add --no-cache git ca-certificates
+
+# Set working directory
+WORKDIR /workspace
+
+# Copy go mod files first for better layer caching
+# This allows Docker to cache the dependency download step
+COPY go.mod go.sum ./
+
+# Download dependencies
+# Using go mod download for better caching
+RUN go mod download
+
+# Copy source code
+COPY . .
+
+# Build the controller binary
+# CGO_ENABLED=0: Build static binary without C dependencies
+# -ldflags: Inject version information at build time
+# -trimpath: Remove file system paths from binary for reproducibility
+# -o: Output binary name
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
+    -ldflags="-s -w \
+        -X main.version=${VERSION} \
+        -X main.gitCommit=${GIT_COMMIT} \
+        -X main.buildDate=${BUILD_DATE}" \
+    -trimpath \
+    -o zstack-ovnkube-controller \
+    ./cmd/zstack-ovnkube-controller
+
+# ============================================================================
+# Stage 2: Runtime stage
+# Uses minimal Alpine image for small footprint and security
+# ============================================================================
+FROM alpine:3.19
+
+# Labels for container metadata
+LABEL maintainer="ZStack <support@zstack.io>"
+LABEL description="ZStack OVN Kubernetes Controller - Control plane component for OVN-based Kubernetes networking"
+LABEL org.opencontainers.image.source="https://github.com/jiayi-1994/zstack-ovn-kubernetes"
+LABEL org.opencontainers.image.title="zstack-ovnkube-controller"
+LABEL org.opencontainers.image.description="Control plane component that manages OVN logical objects for Kubernetes networking"
+
+# Install runtime dependencies
+# - ca-certificates: Required for HTTPS connections to Kubernetes API
+# - tzdata: Timezone data for proper time handling
+RUN apk add --no-cache ca-certificates tzdata
+
+# Create non-root user for security
+# Running as non-root is a security best practice
+RUN addgroup -S zstack && adduser -S -G zstack zstack
+
+# Copy binary from builder stage
+COPY --from=builder /workspace/zstack-ovnkube-controller /usr/local/bin/
+
+# Set ownership and permissions
+RUN chmod +x /usr/local/bin/zstack-ovnkube-controller
+
+# Use non-root user
+USER zstack
+
+# Expose ports
+# 8080: Metrics endpoint (Prometheus)
+# 8081: Health probe endpoint (liveness/readiness)
+EXPOSE 8080 8081
+
+# Set entrypoint
+ENTRYPOINT ["/usr/local/bin/zstack-ovnkube-controller"]
+
+# Default command arguments
+# These can be overridden in Kubernetes deployment
+CMD ["--leader-elect=true", "--metrics-bind-address=:8080", "--health-probe-bind-address=:8081"]

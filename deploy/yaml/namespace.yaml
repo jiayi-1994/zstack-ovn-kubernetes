@@ -1,0 +1,10 @@
+# Namespace for zstack-ovn-kubernetes components
+# All CNI components will be deployed in this namespace
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: zstack-ovn-kubernetes
+  labels:
+    app.kubernetes.io/name: zstack-ovn-kubernetes
+    app.kubernetes.io/managed-by: kubectl

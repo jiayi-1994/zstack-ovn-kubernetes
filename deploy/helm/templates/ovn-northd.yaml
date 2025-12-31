@@ -1,0 +1,133 @@
+{{- if eq .Values.ovn.mode "standalone" }}
+# OVN Northd Deployment
+# northd is the central component that translates high-level network configuration
+# from NB DB into logical flows in SB DB
+# Only deployed in standalone mode
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ovn-northd
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zstack-ovn-kubernetes.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ovn-northd
+spec:
+  replicas: {{ .Values.ovn.standalone.northd.replicas }}
+  strategy:
+    {{- if eq (int .Values.ovn.standalone.northd.replicas) 1 }}
+    type: Recreate
+    {{- else }}
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    {{- end }}
+  selector:
+    matchLabels:
+      {{- include "zstack-ovn-kubernetes.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: ovn-northd
+  template:
+    metadata:
+      labels:
+        {{- include "zstack-ovn-kubernetes.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: ovn-northd
+    spec:
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: Exists
+        {{- if gt (int .Values.ovn.standalone.northd.replicas) 1 }}
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "zstack-ovn-kubernetes.selectorLabels" . | nindent 20 }}
+                    app.kubernetes.io/component: ovn-northd
+                topologyKey: kubernetes.io/hostname
+        {{- end }}
+
+      # Wait for NB and SB databases to be ready
+      initContainers:
+        - name: wait-for-dbs
+          image: {{ include "zstack-ovn-kubernetes.ovnImage" . }}
+          imagePullPolicy: {{ .Values.ovn.standalone.image.pullPolicy }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -ex
+              echo "Waiting for OVN NB DB to be ready..."
+              until ovsdb-client list-dbs tcp:ovn-nb-db.{{ .Release.Namespace }}.svc.cluster.local:6641 2>/dev/null | grep -q OVN_Northbound; do
+                echo "NB DB not ready, waiting..."
+                sleep 2
+              done
+              echo "NB DB is ready!"
+              
+              echo "Waiting for OVN SB DB to be ready..."
+              until ovsdb-client list-dbs tcp:ovn-sb-db.{{ .Release.Namespace }}.svc.cluster.local:6642 2>/dev/null | grep -q OVN_Southbound; do
+                echo "SB DB not ready, waiting..."
+                sleep 2
+              done
+              echo "SB DB is ready!"
+
+      containers:
+        - name: ovn-northd
+          image: {{ include "zstack-ovn-kubernetes.ovnImage" . }}
+          imagePullPolicy: {{ .Values.ovn.standalone.image.pullPolicy }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -ex
+              
+              OVN_NB_DB="tcp:ovn-nb-db.{{ .Release.Namespace }}.svc.cluster.local:6641"
+              OVN_SB_DB="tcp:ovn-sb-db.{{ .Release.Namespace }}.svc.cluster.local:6642"
+              
+              echo "Starting OVN northd..."
+              echo "NB DB: ${OVN_NB_DB}"
+              echo "SB DB: ${OVN_SB_DB}"
+              
+              exec ovn-northd \
+                --ovn-northd-nb-db="${OVN_NB_DB}" \
+                --ovn-northd-sb-db="${OVN_SB_DB}" \
+                -vconsole:info \
+                --pidfile=/var/run/ovn/ovn-northd.pid \
+                --no-chdir
+          env:
+            - name: OVN_NB_DB
+              value: "tcp:ovn-nb-db.{{ .Release.Namespace }}.svc.cluster.local:6641"
+            - name: OVN_SB_DB
+              value: "tcp:ovn-sb-db.{{ .Release.Namespace }}.svc.cluster.local:6642"
+          volumeMounts:
+            - name: ovn-run
+              mountPath: /var/run/ovn
+          livenessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - pgrep -f ovn-northd > /dev/null
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.ovn.standalone.northd.resources | nindent 12 }}
+      volumes:
+        - name: ovn-run
+          emptyDir: {}
+{{- end }}

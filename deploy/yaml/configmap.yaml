@@ -1,0 +1,87 @@
+# ConfigMap for zstack-ovn-kubernetes configuration
+# Contains CNI configuration and controller settings
+#
+# Customize the following values before deployment:
+# - ovn.mode: "standalone" or "external"
+# - ovn.nbdbAddress/sbdbAddress: OVN database addresses (for external mode)
+# - network.clusterCIDR: Pod network CIDR
+# - network.serviceCIDR: Service network CIDR
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zstack-ovn-kubernetes-config
+  namespace: zstack-ovn-kubernetes
+  labels:
+    app.kubernetes.io/name: zstack-ovn-kubernetes
+data:
+  # CNI configuration file
+  # This will be installed to /etc/cni/net.d/10-zstack-ovn.conflist
+  cni-conf.json: |
+    {
+      "cniVersion": "0.4.0",
+      "name": "zstack-ovn-kubernetes",
+      "plugins": [
+        {
+          "type": "zstack-ovn-cni",
+          "logLevel": "info",
+          "logFormat": "json",
+          "socketPath": "/var/run/zstack-ovn/cni-server.sock"
+        }
+      ]
+    }
+
+  # Controller configuration
+  config.yaml: |
+    # OVN Configuration
+    ovn:
+      # Deployment mode: "standalone" or "external"
+      # - standalone: Self-managed OVN databases
+      # - external: Connect to external OVN databases (ZStack)
+      mode: standalone
+      
+      # OVN database addresses (auto-configured for standalone mode)
+      # For external mode, set these to your ZStack OVN database addresses
+      nbdbAddress: "tcp:ovn-nb-db.zstack-ovn-kubernetes.svc.cluster.local:6641"
+      sbdbAddress: "tcp:ovn-sb-db.zstack-ovn-kubernetes.svc.cluster.local:6642"
+      
+      # SSL configuration (optional)
+      ssl:
+        enabled: false
+        # caCert: "/etc/ovn/ssl/ca.crt"
+        # clientCert: "/etc/ovn/ssl/client.crt"
+        # clientKey: "/etc/ovn/ssl/client.key"
+
+    # Network Configuration
+    network:
+      # Pod network CIDR - must not overlap with existing networks
+      clusterCIDR: "10.244.0.0/16"
+      # Service network CIDR
+      serviceCIDR: "10.96.0.0/16"
+      # Subnet size for each node (e.g., 24 means /24 subnet per node)
+      nodeSubnetSize: 24
+
+    # Gateway Configuration
+    gateway:
+      # Gateway mode: "shared" or "local"
+      # - shared: Centralized gateway on specific nodes
+      # - local: Distributed gateway on each node (recommended)
+      mode: "local"
+
+    # Tunnel Configuration
+    tunnel:
+      # Tunnel type: "vxlan" or "geneve"
+      # VXLAN is recommended for ZStack compatibility
+      type: "vxlan"
+      # Tunnel UDP port
+      port: 4789
+
+    # DPDK Configuration (optional)
+    dpdk:
+      enabled: false
+      socketDir: "/var/run/openvswitch"
+
+    # Logging Configuration
+    logging:
+      level: "info"
+      format: "json"

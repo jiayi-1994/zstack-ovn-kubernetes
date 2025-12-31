@@ -1,0 +1,303 @@
+{{- if eq .Values.ovn.mode "standalone" }}
+# OVN Northbound Database
+# The NB DB stores high-level network configuration (logical switches, routers, ports, ACLs)
+# Only deployed in standalone mode
+#
+# Supports two deployment modes:
+# - single: Single instance (dev/test)
+# - ha: 3-node Raft cluster (production)
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ovn-nb-db
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zstack-ovn-kubernetes.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ovn-nb-db
+spec:
+  type: ClusterIP
+  ports:
+    - name: nb-db
+      port: 6641
+      targetPort: 6641
+      protocol: TCP
+    - name: nb-db-raft
+      port: 6643
+      targetPort: 6643
+      protocol: TCP
+  selector:
+    {{- include "zstack-ovn-kubernetes.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: ovn-nb-db
+{{- if eq .Values.ovn.standalone.haMode "ha" }}
+---
+# Headless service for Raft cluster discovery
+apiVersion: v1
+kind: Service
+metadata:
+  name: ovn-nb-db-headless
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zstack-ovn-kubernetes.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ovn-nb-db
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+    - name: nb-db
+      port: 6641
+      targetPort: 6641
+      protocol: TCP
+    - name: nb-db-raft
+      port: 6643
+      targetPort: 6643
+      protocol: TCP
+  selector:
+    {{- include "zstack-ovn-kubernetes.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: ovn-nb-db
+{{- end }}
+---
+{{- if eq .Values.ovn.standalone.haMode "ha" }}
+# StatefulSet for HA mode (3-node Raft cluster)
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ovn-nb-db
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zstack-ovn-kubernetes.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ovn-nb-db
+spec:
+  serviceName: ovn-nb-db-headless
+  replicas: {{ .Values.ovn.standalone.nbdb.replicas }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "zstack-ovn-kubernetes.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: ovn-nb-db
+  template:
+    metadata:
+      labels:
+        {{- include "zstack-ovn-kubernetes.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: ovn-nb-db
+    spec:
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: Exists
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  {{- include "zstack-ovn-kubernetes.selectorLabels" . | nindent 18 }}
+                  app.kubernetes.io/component: ovn-nb-db
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: ovn-nb-db
+          image: {{ include "zstack-ovn-kubernetes.ovnImage" . }}
+          imagePullPolicy: {{ .Values.ovn.standalone.image.pullPolicy }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -ex
+              
+              # Determine cluster members
+              CLUSTER_MEMBERS=""
+              for i in $(seq 0 2); do
+                if [ -n "$CLUSTER_MEMBERS" ]; then
+                  CLUSTER_MEMBERS="${CLUSTER_MEMBERS},"
+                fi
+                CLUSTER_MEMBERS="${CLUSTER_MEMBERS}tcp:ovn-nb-db-${i}.ovn-nb-db-headless.{{ .Release.Namespace }}.svc.cluster.local:6643"
+              done
+              
+              # Initialize or join cluster
+              if [ ! -f /var/lib/ovn/ovnnb_db.db ]; then
+                if [ "$HOSTNAME" = "ovn-nb-db-0" ]; then
+                  echo "Initializing NB DB cluster leader..."
+                  ovsdb-tool create-cluster /var/lib/ovn/ovnnb_db.db /usr/share/ovn/ovn-nb.ovsschema \
+                    tcp:${HOSTNAME}.ovn-nb-db-headless.{{ .Release.Namespace }}.svc.cluster.local:6643
+                else
+                  echo "Joining NB DB cluster..."
+                  ovsdb-tool join-cluster /var/lib/ovn/ovnnb_db.db OVN_Northbound \
+                    tcp:${HOSTNAME}.ovn-nb-db-headless.{{ .Release.Namespace }}.svc.cluster.local:6643 \
+                    tcp:ovn-nb-db-0.ovn-nb-db-headless.{{ .Release.Namespace }}.svc.cluster.local:6643
+                fi
+              fi
+              
+              exec ovsdb-server /var/lib/ovn/ovnnb_db.db \
+                --remote=ptcp:6641:0.0.0.0 \
+                --remote=db:OVN_Northbound,NB_Global,connections \
+                --private-key=db:OVN_Northbound,SSL,private_key \
+                --certificate=db:OVN_Northbound,SSL,certificate \
+                --ca-cert=db:OVN_Northbound,SSL,ca_cert \
+                --pidfile=/var/run/ovn/ovnnb_db.pid \
+                --log-file=/var/log/ovn/ovsdb-server-nb.log \
+                --no-chdir
+          ports:
+            - name: nb-db
+              containerPort: 6641
+              protocol: TCP
+            - name: nb-db-raft
+              containerPort: 6643
+              protocol: TCP
+          volumeMounts:
+            - name: ovn-data
+              mountPath: /var/lib/ovn
+            - name: ovn-run
+              mountPath: /var/run/ovn
+            - name: ovn-log
+              mountPath: /var/log/ovn
+          livenessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - ovsdb-client list-dbs tcp:127.0.0.1:6641 | grep -q OVN_Northbound
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - ovsdb-client list-dbs tcp:127.0.0.1:6641 | grep -q OVN_Northbound
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            {{- toYaml .Values.ovn.standalone.nbdb.resources | nindent 12 }}
+      volumes:
+        - name: ovn-run
+          emptyDir: {}
+        - name: ovn-log
+          emptyDir: {}
+  {{- if .Values.ovn.standalone.nbdb.storage.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: ovn-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.ovn.standalone.nbdb.storage.storageClass }}
+        storageClassName: {{ .Values.ovn.standalone.nbdb.storage.storageClass }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.ovn.standalone.nbdb.storage.size }}
+  {{- else }}
+        - name: ovn-data
+          emptyDir: {}
+  {{- end }}
+{{- else }}
+# Deployment for single instance mode
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ovn-nb-db
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zstack-ovn-kubernetes.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ovn-nb-db
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "zstack-ovn-kubernetes.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: ovn-nb-db
+  template:
+    metadata:
+      labels:
+        {{- include "zstack-ovn-kubernetes.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: ovn-nb-db
+    spec:
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: Exists
+      containers:
+        - name: ovn-nb-db
+          image: {{ include "zstack-ovn-kubernetes.ovnImage" . }}
+          imagePullPolicy: {{ .Values.ovn.standalone.image.pullPolicy }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -ex
+              if [ ! -f /var/lib/ovn/ovnnb_db.db ]; then
+                echo "Initializing OVN Northbound Database..."
+                ovsdb-tool create /var/lib/ovn/ovnnb_db.db /usr/share/ovn/ovn-nb.ovsschema
+              fi
+              
+              exec /usr/share/ovn/scripts/ovn-ctl run_nb_ovsdb \
+                --db-nb-addr=0.0.0.0 \
+                --db-nb-port=6641 \
+                --db-nb-create-insecure-remote=yes \
+                --ovn-nb-db-ssl-key= \
+                --ovn-nb-db-ssl-cert= \
+                --ovn-nb-db-ssl-ca-cert=
+          ports:
+            - name: nb-db
+              containerPort: 6641
+              protocol: TCP
+            - name: nb-db-raft
+              containerPort: 6643
+              protocol: TCP
+          volumeMounts:
+            - name: ovn-data
+              mountPath: /var/lib/ovn
+            - name: ovn-run
+              mountPath: /var/run/ovn
+          livenessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - ovsdb-client list-dbs tcp:127.0.0.1:6641 | grep -q OVN_Northbound
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - ovsdb-client list-dbs tcp:127.0.0.1:6641 | grep -q OVN_Northbound
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            {{- toYaml .Values.ovn.standalone.nbdb.resources | nindent 12 }}
+      volumes:
+        - name: ovn-data
+          emptyDir: {}
+        - name: ovn-run
+          emptyDir: {}
+{{- end }}
+{{- end }}

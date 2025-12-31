@@ -1,0 +1,154 @@
+# Controller Deployment
+# zstack-ovnkube-controller is the control plane component that:
+# - Watches Kubernetes resources (Pods, Services, NetworkPolicies, Subnets)
+# - Manages OVN logical objects (Logical Switches, Ports, Load Balancers, ACLs)
+# - Handles IP allocation and network configuration
+#
+# Supports leader election for high availability
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "zstack-ovn-kubernetes.fullname" . }}-controller
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zstack-ovn-kubernetes.controller.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.controller.replicas }}
+  selector:
+    matchLabels:
+      {{- include "zstack-ovn-kubernetes.controller.selectorLabels" . | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        {{- include "zstack-ovn-kubernetes.controller.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "zstack-ovn-kubernetes.controller.serviceAccountName" . }}
+      
+      # Prefer running on control-plane nodes
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: Exists
+        # Anti-affinity to spread controller replicas
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "zstack-ovn-kubernetes.controller.selectorLabels" . | nindent 20 }}
+                topologyKey: kubernetes.io/hostname
+
+      {{- if eq .Values.ovn.mode "standalone" }}
+      # Wait for OVN databases in standalone mode
+      initContainers:
+        - name: wait-for-ovn-db
+          image: {{ include "zstack-ovn-kubernetes.ovnImage" . }}
+          imagePullPolicy: {{ .Values.ovn.standalone.image.pullPolicy }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -ex
+              echo "Waiting for OVN NB DB to be ready..."
+              until ovsdb-client list-dbs {{ include "zstack-ovn-kubernetes.nbdbAddress" . }} 2>/dev/null | grep -q OVN_Northbound; do
+                echo "NB DB not ready, waiting..."
+                sleep 2
+              done
+              echo "NB DB is ready!"
+              
+              echo "Waiting for OVN SB DB to be ready..."
+              until ovsdb-client list-dbs {{ include "zstack-ovn-kubernetes.sbdbAddress" . }} 2>/dev/null | grep -q OVN_Southbound; do
+                echo "SB DB not ready, waiting..."
+                sleep 2
+              done
+              echo "SB DB is ready!"
+      {{- end }}
+
+      containers:
+        - name: controller
+          image: "{{ .Values.controller.image.repository }}:{{ .Values.controller.image.tag }}"
+          imagePullPolicy: {{ .Values.controller.image.pullPolicy }}
+          command:
+            - /zstack-ovnkube-controller
+          args:
+            - --config=/etc/zstack-ovn/config.yaml
+            - --leader-elect={{ gt (int .Values.controller.replicas) 1 }}
+            - --leader-elect-lease-duration=15s
+            - --leader-elect-renew-deadline=10s
+            - --leader-elect-retry-period=2s
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: OVN_NB_DB
+              value: {{ include "zstack-ovn-kubernetes.nbdbAddress" . | quote }}
+            - name: OVN_SB_DB
+              value: {{ include "zstack-ovn-kubernetes.sbdbAddress" . | quote }}
+          ports:
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+            - name: health
+              containerPort: 8081
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            {{- toYaml .Values.controller.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/zstack-ovn
+              readOnly: true
+            {{- if .Values.ovn.ssl.enabled }}
+            - name: ovn-ssl
+              mountPath: /etc/ovn/ssl
+              readOnly: true
+            {{- end }}
+      
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "zstack-ovn-kubernetes.fullname" . }}-config
+        {{- if .Values.ovn.ssl.enabled }}
+        - name: ovn-ssl
+          secret:
+            secretName: {{ include "zstack-ovn-kubernetes.fullname" . }}-ovn-ssl
+        {{- end }}
