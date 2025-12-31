@@ -101,7 +101,21 @@ jobs:
         run: go mod download
 
       - name: Run tests
-        run: go test -v -race -coverprofile=coverage.out ./pkg/...
+        run: |
+          set -o pipefail
+          go test -v -race -coverprofile=coverage.out ./pkg/... 2>&1 | tee test-output.txt
+          TEST_EXIT_CODE=${PIPESTATUS[0]}
+          
+          # Show summary
+          echo "=== Test Summary ==="
+          grep -E "^(ok|FAIL|---)" test-output.txt | head -50 || true
+          
+          if [ $TEST_EXIT_CODE -ne 0 ]; then
+            echo "::error::Tests failed with exit code $TEST_EXIT_CODE"
+            echo "=== Failed Tests ==="
+            grep -B10 "^--- FAIL" test-output.txt || true
+            exit $TEST_EXIT_CODE
+          fi
 
       - name: Upload coverage report
         uses: actions/upload-artifact@v4

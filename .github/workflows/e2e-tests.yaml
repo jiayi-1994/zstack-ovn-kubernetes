@@ -86,7 +86,20 @@ jobs:
 
       - name: Run unit tests
         run: |
-          go test -v -race -coverprofile=coverage.out ./pkg/...
+          set -o pipefail
+          go test -v -race -coverprofile=coverage.out ./pkg/... 2>&1 | tee test-output.txt
+          TEST_EXIT_CODE=${PIPESTATUS[0]}
+          
+          # Show summary
+          echo "=== Test Summary ==="
+          grep -E "^(ok|FAIL|---)" test-output.txt || true
+          
+          if [ $TEST_EXIT_CODE -ne 0 ]; then
+            echo "::error::Unit tests failed with exit code $TEST_EXIT_CODE"
+            echo "=== Failed Tests ==="
+            grep -B5 "^--- FAIL" test-output.txt || true
+            exit $TEST_EXIT_CODE
+          fi
 
       - name: Upload coverage
         uses: actions/upload-artifact@v4
