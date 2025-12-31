@@ -252,38 +252,43 @@ jobs:
 
       - name: Deploy zstack-ovn-kubernetes (Standalone)
         run: |
-          # Apply CRDs
+          # 1. Create namespace first
+          kubectl apply -f deploy/yaml/namespace.yaml
+          
+          # 2. Apply CRDs
           kubectl apply -f deploy/yaml/subnet-crd.yaml
           
-          # Apply RBAC
+          # 3. Apply RBAC
           kubectl apply -f deploy/yaml/rbac.yaml
           
-          # Apply ConfigMap with standalone settings
+          # 4. Apply ConfigMap with standalone settings
           kubectl apply -f deploy/yaml/configmap.yaml
           
-          # Deploy OVN databases (standalone mode)
+          # 5. Deploy OVN databases (standalone mode)
           kubectl apply -f deploy/yaml/ovn-databases.yaml
           
           # Wait for OVN databases to be ready
-          kubectl -n kube-system wait --for=condition=ready pod -l app=ovn-central --timeout=300s || true
+          echo "Waiting for OVN databases..."
+          sleep 30
+          kubectl -n zstack-ovn-kubernetes get pods || true
           
-          # Deploy controller
+          # 6. Deploy controller
           kubectl apply -f deploy/yaml/controller-deployment.yaml
           
-          # Deploy node agent
+          # 7. Deploy node agent
           kubectl apply -f deploy/yaml/node-daemonset.yaml
           
           # Wait for all pods to be ready
           sleep 30
-          kubectl -n kube-system get pods
+          kubectl -n zstack-ovn-kubernetes get pods
 
       - name: Wait for CNI to be ready
         run: |
           echo "Waiting for CNI pods to be ready..."
-          kubectl -n kube-system wait --for=condition=ready pod -l app.kubernetes.io/name=zstack-ovn-kubernetes --timeout=300s || {
+          kubectl -n zstack-ovn-kubernetes wait --for=condition=ready pod -l app.kubernetes.io/name=zstack-ovn-kubernetes --timeout=300s || {
             echo "CNI pods not ready, checking status..."
-            kubectl -n kube-system get pods -o wide
-            kubectl -n kube-system describe pods -l app.kubernetes.io/name=zstack-ovn-kubernetes
+            kubectl -n zstack-ovn-kubernetes get pods -o wide
+            kubectl -n zstack-ovn-kubernetes describe pods -l app.kubernetes.io/name=zstack-ovn-kubernetes
             exit 1
           }
 
@@ -310,10 +315,10 @@ jobs:
         if: failure()
         run: |
           echo "=== CNI Pod Logs ==="
-          kubectl -n kube-system logs -l app.kubernetes.io/name=zstack-ovn-kubernetes --tail=100 || true
+          kubectl -n zstack-ovn-kubernetes logs -l app.kubernetes.io/name=zstack-ovn-kubernetes --tail=100 || true
           
           echo "=== OVN Central Logs ==="
-          kubectl -n kube-system logs -l app=ovn-central --tail=100 || true
+          kubectl -n zstack-ovn-kubernetes logs -l app=ovn-central --tail=100 || true
           
           echo "=== Node Status ==="
           kubectl get nodes -o wide
@@ -417,9 +422,36 @@ jobs:
 
       - name: Deploy CNI
         run: |
-          kubectl apply -f deploy/yaml/
+          # Deploy in correct order
+          # 1. Namespace first
+          kubectl apply -f deploy/yaml/namespace.yaml
+          
+          # 2. CRDs
+          kubectl apply -f deploy/yaml/subnet-crd.yaml
+          
+          # 3. RBAC
+          kubectl apply -f deploy/yaml/rbac.yaml
+          
+          # 4. ConfigMap
+          kubectl apply -f deploy/yaml/configmap.yaml
+          
+          # 5. OVN databases (standalone mode)
+          kubectl apply -f deploy/yaml/ovn-databases.yaml
+          
+          # Wait for OVN databases to be ready
+          echo "Waiting for OVN databases..."
+          sleep 30
+          kubectl -n zstack-ovn-kubernetes get pods || true
+          
+          # 6. Controller
+          kubectl apply -f deploy/yaml/controller-deployment.yaml
+          
+          # 7. Node DaemonSet
+          kubectl apply -f deploy/yaml/node-daemonset.yaml
+          
+          # Wait for all pods to be ready
           sleep 60
-          kubectl -n kube-system get pods
+          kubectl -n zstack-ovn-kubernetes get pods
 
       - name: Run connectivity tests
         env:
