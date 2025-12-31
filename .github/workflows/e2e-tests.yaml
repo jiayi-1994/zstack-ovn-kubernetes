@@ -227,6 +227,11 @@ jobs:
           kind load docker-image ghcr.io/jiayi-1994/zstack-ovnkube-controller:e2e --name e2e-standalone
           kind load docker-image ghcr.io/jiayi-1994/zstack-ovnkube-node:e2e --name e2e-standalone
           kind load docker-image ghcr.io/jiayi-1994/zstack-ovn-cni:e2e --name e2e-standalone
+          
+          # Pre-pull OVN images for standalone mode
+          echo "Pulling OVN images..."
+          docker pull ghcr.io/ovn-org/ovn-kubernetes/ovn-kube-ubuntu:master
+          kind load docker-image ghcr.io/ovn-org/ovn-kubernetes/ovn-kube-ubuntu:master --name e2e-standalone
 
       - name: Install OVS on Kind nodes
         run: |
@@ -272,11 +277,11 @@ jobs:
           sleep 30
           kubectl -n zstack-ovn-kubernetes get pods || true
           
-          # 6. Deploy controller
-          kubectl apply -f deploy/yaml/controller-deployment.yaml
+          # 6. Deploy controller (with e2e image tag)
+          sed 's/:0.1.0/:e2e/g' deploy/yaml/controller-deployment.yaml | kubectl apply -f -
           
-          # 7. Deploy node agent
-          kubectl apply -f deploy/yaml/node-daemonset.yaml
+          # 7. Deploy node agent (with e2e image tag)
+          sed 's/:0.1.0/:e2e/g' deploy/yaml/node-daemonset.yaml | kubectl apply -f -
           
           # Wait for all pods to be ready
           sleep 30
@@ -399,6 +404,11 @@ jobs:
           kind load docker-image ghcr.io/jiayi-1994/zstack-ovnkube-node:e2e --name e2e-connectivity
           kind load docker-image ghcr.io/jiayi-1994/zstack-ovn-cni:e2e --name e2e-connectivity
           
+          # Pre-pull OVN images for standalone mode
+          echo "Pulling OVN images..."
+          docker pull ghcr.io/ovn-org/ovn-kubernetes/ovn-kube-ubuntu:master
+          kind load docker-image ghcr.io/ovn-org/ovn-kubernetes/ovn-kube-ubuntu:master --name e2e-connectivity
+          
           # Install and start OVS on nodes (without systemd)
           for node in $(kind get nodes --name e2e-connectivity); do
             echo "Installing OVS on $node..."
@@ -443,11 +453,11 @@ jobs:
           sleep 30
           kubectl -n zstack-ovn-kubernetes get pods || true
           
-          # 6. Controller
-          kubectl apply -f deploy/yaml/controller-deployment.yaml
+          # 6. Controller (with e2e image tag)
+          sed 's/:0.1.0/:e2e/g' deploy/yaml/controller-deployment.yaml | kubectl apply -f -
           
-          # 7. Node DaemonSet
-          kubectl apply -f deploy/yaml/node-daemonset.yaml
+          # 7. Node DaemonSet (with e2e image tag)
+          sed 's/:0.1.0/:e2e/g' deploy/yaml/node-daemonset.yaml | kubectl apply -f -
           
           # Wait for all pods to be ready
           sleep 60
