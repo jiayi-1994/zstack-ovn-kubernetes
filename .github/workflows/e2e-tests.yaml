@@ -218,8 +218,17 @@ jobs:
       - name: Install OVS on Kind nodes
         run: |
           for node in $(kind get nodes --name e2e-standalone); do
+            echo "Installing OVS on $node..."
             docker exec $node bash -c "apt-get update && apt-get install -y openvswitch-switch"
-            docker exec $node bash -c "service openvswitch-switch start"
+            # Start OVS directly without systemd (Kind nodes don't have full systemd)
+            docker exec $node bash -c "mkdir -p /var/run/openvswitch /var/log/openvswitch"
+            docker exec $node bash -c "ovsdb-server --remote=punix:/var/run/openvswitch/db.sock \
+              --remote=db:Open_vSwitch,Open_vSwitch,manager_options \
+              --pidfile --detach --log-file=/var/log/openvswitch/ovsdb-server.log || true"
+            docker exec $node bash -c "ovs-vsctl --no-wait init || true"
+            docker exec $node bash -c "ovs-vswitchd --pidfile --detach --log-file=/var/log/openvswitch/ovs-vswitchd.log || true"
+            # Verify OVS is running
+            docker exec $node bash -c "ovs-vsctl show" || echo "Warning: OVS may not be fully started on $node"
           done
 
       - name: Deploy zstack-ovn-kubernetes (Standalone)
@@ -366,10 +375,19 @@ jobs:
           kind load docker-image ghcr.io/jiayi-1994/zstack-ovnkube-node:e2e --name e2e-connectivity
           kind load docker-image ghcr.io/jiayi-1994/zstack-ovn-cni:e2e --name e2e-connectivity
           
-          # Install OVS on nodes
+          # Install and start OVS on nodes (without systemd)
           for node in $(kind get nodes --name e2e-connectivity); do
+            echo "Installing OVS on $node..."
             docker exec $node bash -c "apt-get update && apt-get install -y openvswitch-switch"
-            docker exec $node bash -c "service openvswitch-switch start"
+            # Start OVS directly without systemd
+            docker exec $node bash -c "mkdir -p /var/run/openvswitch"
+            docker exec $node bash -c "ovsdb-server --remote=punix:/var/run/openvswitch/db.sock \
+              --remote=db:Open_vSwitch,Open_vSwitch,manager_options \
+              --pidfile --detach --log-file=/var/log/openvswitch/ovsdb-server.log || true"
+            docker exec $node bash -c "ovs-vsctl --no-wait init || true"
+            docker exec $node bash -c "ovs-vswitchd --pidfile --detach --log-file=/var/log/openvswitch/ovs-vswitchd.log || true"
+            # Verify OVS is running
+            docker exec $node bash -c "ovs-vsctl show" || echo "Warning: OVS may not be fully started on $node"
           done
 
       - name: Deploy CNI
