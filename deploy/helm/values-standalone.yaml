@@ -17,9 +17,14 @@ ovn:
     # - ha: 3-node Raft cluster (production)
     haMode: single
 
+    # Control plane node IP address (required for node agents to connect to OVN DBs)
+    # If not set, will use Service DNS names (requires working DNS)
+    # Set this to the IP of the control-plane node where OVN DBs run
+    controlPlaneIP: ""
+
     # Database image configuration
     image:
-      repository: ghcr.io/ovn-org/ovn-kubernetes/ovn-kube-ubuntu
+      repository: docker.gh-proxy.com/ghcr.io/ovn-org/ovn-kubernetes/ovn-kube-ubuntu
       tag: master
       pullPolicy: IfNotPresent
 
@@ -77,3 +82,50 @@ gateway:
 tunnel:
   type: vxlan
   port: 4789
+
+# Controller Configuration
+controller:
+  replicas: 1
+  image:
+    repository: docker.gh-proxy.com/ghcr.io/jiayi-1994/zstack-ovnkube-controller
+    tag: "0.1.0"
+    pullPolicy: IfNotPresent
+  serviceAccount:
+    name: ""
+    annotations: {}
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
+# Node Agent Configuration
+node:
+  image:
+    repository: docker.gh-proxy.com/ghcr.io/jiayi-1994/zstack-ovnkube-node
+    tag: "0.1.0"
+    pullPolicy: IfNotPresent
+  serviceAccount:
+    name: ""
+    annotations: {}
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
+# CNI Configuration
+cni:
+  image:
+    repository: docker.gh-proxy.com/ghcr.io/jiayi-1994/zstack-ovn-cni
+    tag: "0.1.0"
+    pullPolicy: IfNotPresent
+
+# Logging Configuration
+logging:
+  level: info
+  format: json

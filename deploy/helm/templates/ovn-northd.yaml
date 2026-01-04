@@ -35,24 +35,23 @@ spec:
     spec:
       # Use host network to avoid chicken-and-egg problem with CNI
       hostNetwork: true
-      dnsPolicy: ClusterFirstWithHostNet
+      # Use Default DNS policy - ClusterFirstWithHostNet may fail before CNI is ready
+      dnsPolicy: Default
+      # Tolerate all taints to run on any node during bootstrap
       tolerations:
-        - key: node-role.kubernetes.io/control-plane
-          operator: Exists
-          effect: NoSchedule
-        - key: node-role.kubernetes.io/master
-          operator: Exists
-          effect: NoSchedule
-        # Tolerate not-ready nodes during bootstrap
-        - key: node.kubernetes.io/not-ready
-          operator: Exists
-          effect: NoSchedule
+        - operator: Exists
       affinity:
         nodeAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
             - weight: 100
               preference:
                 matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: Exists
+          # Must run on the same node as OVN NB/SB databases to use localhost
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
                   - key: node-role.kubernetes.io/control-plane
                     operator: Exists
         {{- if gt (int .Values.ovn.standalone.northd.replicas) 1 }}
@@ -77,15 +76,16 @@ spec:
             - -c
             - |
               set -ex
-              echo "Waiting for OVN NB DB to be ready..."
-              until ovsdb-client list-dbs tcp:ovn-nb-db.{{ .Release.Namespace }}.svc.cluster.local:6641 2>/dev/null | grep -q OVN_Northbound; do
+              # Use localhost since we're on the same node as the DBs (hostNetwork)
+              echo "Waiting for OVN NB DB to be ready on localhost..."
+              until ovsdb-client list-dbs tcp:127.0.0.1:6641 2>/dev/null | grep -q OVN_Northbound; do
                 echo "NB DB not ready, waiting..."
                 sleep 2
               done
               echo "NB DB is ready!"
               
-              echo "Waiting for OVN SB DB to be ready..."
-              until ovsdb-client list-dbs tcp:ovn-sb-db.{{ .Release.Namespace }}.svc.cluster.local:6642 2>/dev/null | grep -q OVN_Southbound; do
+              echo "Waiting for OVN SB DB to be ready on localhost..."
+              until ovsdb-client list-dbs tcp:127.0.0.1:6642 2>/dev/null | grep -q OVN_Southbound; do
                 echo "SB DB not ready, waiting..."
                 sleep 2
               done
@@ -101,8 +101,9 @@ spec:
             - |
               set -ex
               
-              OVN_NB_DB="tcp:ovn-nb-db.{{ .Release.Namespace }}.svc.cluster.local:6641"
-              OVN_SB_DB="tcp:ovn-sb-db.{{ .Release.Namespace }}.svc.cluster.local:6642"
+              # Use localhost since we're on the same node as the DBs (hostNetwork)
+              OVN_NB_DB="tcp:127.0.0.1:6641"
+              OVN_SB_DB="tcp:127.0.0.1:6642"
               
               echo "Starting OVN northd..."
               echo "NB DB: ${OVN_NB_DB}"
@@ -116,9 +117,9 @@ spec:
                 --no-chdir
           env:
             - name: OVN_NB_DB
-              value: "tcp:ovn-nb-db.{{ .Release.Namespace }}.svc.cluster.local:6641"
+              value: "tcp:127.0.0.1:6641"
             - name: OVN_SB_DB
-              value: "tcp:ovn-sb-db.{{ .Release.Namespace }}.svc.cluster.local:6642"
+              value: "tcp:127.0.0.1:6642"
           volumeMounts:
             - name: ovn-run
               mountPath: /var/run/ovn

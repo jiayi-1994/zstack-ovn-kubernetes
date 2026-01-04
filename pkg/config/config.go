@@ -322,10 +322,18 @@ func (c *Config) LoadFromFile(path string) error {
 // ApplyEnvOverrides applies environment variable overrides to the configuration
 //
 // Environment variables follow the pattern: ZSTACK_OVN_<SECTION>_<KEY>
+// Standard OVN environment variables (OVN_NB_DB, OVN_SB_DB) are also supported as fallbacks.
+//
+// Priority (highest to lowest):
+//   - ZSTACK_OVN_* (project-specific, takes precedence)
+//   - OVN_NB_DB / OVN_SB_DB (standard OVN env vars)
+//
 // Examples:
 //   - ZSTACK_OVN_MODE=external
 //   - ZSTACK_OVN_NBDB_ADDRESS=tcp:192.168.1.100:6641
 //   - ZSTACK_OVN_SBDB_ADDRESS=tcp:192.168.1.100:6642
+//   - OVN_NB_DB=tcp:192.168.1.100:6641 (standard OVN env var)
+//   - OVN_SB_DB=tcp:192.168.1.100:6642 (standard OVN env var)
 //   - ZSTACK_OVN_CLUSTER_CIDR=10.244.0.0/16
 //   - ZSTACK_OVN_SERVICE_CIDR=10.96.0.0/16
 //   - ZSTACK_OVN_TUNNEL_TYPE=vxlan
@@ -336,10 +344,20 @@ func (c *Config) ApplyEnvOverrides() {
 	if v := os.Getenv("ZSTACK_OVN_MODE"); v != "" {
 		c.OVN.Mode = v
 	}
+
+	// OVN NB DB address - project-specific env var takes precedence over standard OVN env var
 	if v := os.Getenv("ZSTACK_OVN_NBDB_ADDRESS"); v != "" {
 		c.OVN.NBDBAddress = v
+	} else if v := os.Getenv("OVN_NB_DB"); v != "" {
+		// Standard OVN env var (lower priority)
+		c.OVN.NBDBAddress = v
 	}
+
+	// OVN SB DB address - project-specific env var takes precedence over standard OVN env var
 	if v := os.Getenv("ZSTACK_OVN_SBDB_ADDRESS"); v != "" {
+		c.OVN.SBDBAddress = v
+	} else if v := os.Getenv("OVN_SB_DB"); v != "" {
+		// Standard OVN env var (lower priority)
 		c.OVN.SBDBAddress = v
 	}
 
@@ -506,21 +524,25 @@ func (c *Config) IsExternalMode() bool {
 }
 
 // GetNBDBAddress returns the Northbound DB address
-// For standalone mode, returns the local address
+// Returns the configured address if non-empty, otherwise falls back to Unix socket
+// This follows the ovn-kubernetes pattern: use configured address directly
 func (c *Config) GetNBDBAddress() string {
-	if c.IsStandaloneMode() {
-		return "unix:/var/run/ovn/ovnnb_db.sock"
+	if c.OVN.NBDBAddress != "" {
+		return c.OVN.NBDBAddress
 	}
-	return c.OVN.NBDBAddress
+	// Fall back to Unix socket only when no address configured
+	return "unix:/var/run/ovn/ovnnb_db.sock"
 }
 
 // GetSBDBAddress returns the Southbound DB address
-// For standalone mode, returns the local address
+// Returns the configured address if non-empty, otherwise falls back to Unix socket
+// This follows the ovn-kubernetes pattern: use configured address directly
 func (c *Config) GetSBDBAddress() string {
-	if c.IsStandaloneMode() {
-		return "unix:/var/run/ovn/ovnsb_db.sock"
+	if c.OVN.SBDBAddress != "" {
+		return c.OVN.SBDBAddress
 	}
-	return c.OVN.SBDBAddress
+	// Fall back to Unix socket only when no address configured
+	return "unix:/var/run/ovn/ovnsb_db.sock"
 }
 
 // ValidateExternalModeConfig performs additional validation for external mode

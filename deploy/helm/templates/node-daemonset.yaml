@@ -32,7 +32,10 @@ spec:
       serviceAccountName: {{ include "zstack-ovn-kubernetes.node.serviceAccountName" . }}
       hostNetwork: true
       hostPID: true
-      dnsPolicy: ClusterFirstWithHostNet
+      # Use Default DNS policy - ClusterFirstWithHostNet may fail before CNI is ready
+      dnsPolicy: Default
+      # Priority class for CNI components
+      priorityClassName: system-node-critical
       
       # Run on all nodes including control-plane
       tolerations:
@@ -98,7 +101,7 @@ spec:
               echo "Setting OVS external-ids for hostname: ${HOSTNAME}"
               ovs-vsctl set open . external-ids:system-id="${HOSTNAME}"
               ovs-vsctl set open . external-ids:hostname="${HOSTNAME}"
-              ovs-vsctl set open . external-ids:ovn-remote="{{ include "zstack-ovn-kubernetes.sbdbAddress" . }}"
+              ovs-vsctl set open . external-ids:ovn-remote="{{ include "zstack-ovn-kubernetes.sbdbAddressForNode" . }}"
               ovs-vsctl set open . external-ids:ovn-encap-type="{{ .Values.tunnel.type }}"
               
               # Get node IP for encapsulation
@@ -138,9 +141,9 @@ spec:
                 fieldRef:
                   fieldPath: metadata.namespace
             - name: OVN_NB_DB
-              value: {{ include "zstack-ovn-kubernetes.nbdbAddress" . | quote }}
+              value: {{ include "zstack-ovn-kubernetes.nbdbAddressForNode" . | quote }}
             - name: OVN_SB_DB
-              value: {{ include "zstack-ovn-kubernetes.sbdbAddress" . | quote }}
+              value: {{ include "zstack-ovn-kubernetes.sbdbAddressForNode" . | quote }}
           ports:
             - name: metrics
               containerPort: 9091

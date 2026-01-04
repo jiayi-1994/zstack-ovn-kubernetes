@@ -84,33 +84,71 @@ app.kubernetes.io/component: node
 Create the name of the service account to use for controller
 */}}
 {{- define "zstack-ovn-kubernetes.controller.serviceAccountName" -}}
-{{- default (printf "%s-controller" (include "zstack-ovn-kubernetes.fullname" .)) .Values.controller.serviceAccount.name }}
+{{- if and .Values.controller .Values.controller.serviceAccount .Values.controller.serviceAccount.name }}
+{{- .Values.controller.serviceAccount.name }}
+{{- else }}
+{{- printf "%s-controller" (include "zstack-ovn-kubernetes.fullname" .) }}
+{{- end }}
 {{- end }}
 
 {{/*
 Create the name of the service account to use for node agent
 */}}
 {{- define "zstack-ovn-kubernetes.node.serviceAccountName" -}}
-{{- default (printf "%s-node" (include "zstack-ovn-kubernetes.fullname" .)) .Values.node.serviceAccount.name }}
+{{- if and .Values.node .Values.node.serviceAccount .Values.node.serviceAccount.name }}
+{{- .Values.node.serviceAccount.name }}
+{{- else }}
+{{- printf "%s-node" (include "zstack-ovn-kubernetes.fullname" .) }}
+{{- end }}
 {{- end }}
 
 {{/*
 OVN NB DB address - returns the address based on mode
+For standalone mode, use localhost since controller runs on same node as DBs
 */}}
 {{- define "zstack-ovn-kubernetes.nbdbAddress" -}}
 {{- if eq .Values.ovn.mode "external" }}
 {{- .Values.ovn.nbdbAddress }}
+{{- else }}
+{{- "tcp:127.0.0.1:6641" }}
+{{- end }}
+{{- end }}
+
+{{/*
+OVN SB DB address - returns the address based on mode
+For standalone mode, use localhost since controller runs on same node as DBs
+*/}}
+{{- define "zstack-ovn-kubernetes.sbdbAddress" -}}
+{{- if eq .Values.ovn.mode "external" }}
+{{- .Values.ovn.sbdbAddress }}
+{{- else }}
+{{- "tcp:127.0.0.1:6642" }}
+{{- end }}
+{{- end }}
+
+{{/*
+OVN NB DB address for node agents - returns the address based on mode
+For standalone mode, use the control-plane IP since node agents run on all nodes
+*/}}
+{{- define "zstack-ovn-kubernetes.nbdbAddressForNode" -}}
+{{- if eq .Values.ovn.mode "external" }}
+{{- .Values.ovn.nbdbAddress }}
+{{- else if .Values.ovn.standalone.controlPlaneIP }}
+{{- printf "tcp:%s:6641" .Values.ovn.standalone.controlPlaneIP }}
 {{- else }}
 {{- printf "tcp:ovn-nb-db.%s.svc.cluster.local:6641" .Release.Namespace }}
 {{- end }}
 {{- end }}
 
 {{/*
-OVN SB DB address - returns the address based on mode
+OVN SB DB address for node agents - returns the address based on mode
+For standalone mode, use the control-plane IP since node agents run on all nodes
 */}}
-{{- define "zstack-ovn-kubernetes.sbdbAddress" -}}
+{{- define "zstack-ovn-kubernetes.sbdbAddressForNode" -}}
 {{- if eq .Values.ovn.mode "external" }}
 {{- .Values.ovn.sbdbAddress }}
+{{- else if .Values.ovn.standalone.controlPlaneIP }}
+{{- printf "tcp:%s:6642" .Values.ovn.standalone.controlPlaneIP }}
 {{- else }}
 {{- printf "tcp:ovn-sb-db.%s.svc.cluster.local:6642" .Release.Namespace }}
 {{- end }}

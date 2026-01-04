@@ -29,9 +29,14 @@ ovn:
     # - ha: 3-node Raft cluster (suitable for production)
     haMode: single
 
+    # Control plane node IP address (required for node agents to connect to OVN DBs)
+    # If not set, will use Service DNS names (requires working DNS)
+    # Set this to the IP of the control-plane node where OVN DBs run
+    controlPlaneIP: ""
+
     # Database image configuration
     image:
-      repository: ghcr.io/ovn-org/ovn-kubernetes/ovn-kube-ubuntu
+      repository: docker.gh-proxy.com/ghcr.io/ovn-org/ovn-kubernetes/ovn-kube-ubuntu
       tag: master
       pullPolicy: IfNotPresent
 
@@ -123,9 +128,16 @@ controller:
 
   # Image configuration
   image:
-    repository: ghcr.io/jiayi-1994/zstack-ovnkube-controller
+    repository: docker.gh-proxy.com/ghcr.io/jiayi-1994/zstack-ovnkube-controller
     tag: "0.1.0"
     pullPolicy: IfNotPresent
+
+  # Service account configuration
+  serviceAccount:
+    # Name of the service account (leave empty to use default)
+    name: ""
+    # Annotations to add to the service account
+    annotations: {}
 
   # Resource limits
   resources:
@@ -140,9 +152,16 @@ controller:
 node:
   # Image configuration
   image:
-    repository: ghcr.io/jiayi-1994/zstack-ovnkube-node
+    repository: docker.gh-proxy.com/ghcr.io/jiayi-1994/zstack-ovnkube-node
     tag: "0.1.0"
     pullPolicy: IfNotPresent
+
+  # Service account configuration
+  serviceAccount:
+    # Name of the service account (leave empty to use default)
+    name: ""
+    # Annotations to add to the service account
+    annotations: {}
 
   # Resource limits
   resources:
@@ -157,7 +176,7 @@ node:
 cni:
   # CNI binary image
   image:
-    repository: ghcr.io/jiayi-1994/zstack-ovn-cni
+    repository: docker.gh-proxy.com/ghcr.io/jiayi-1994/zstack-ovn-cni
     tag: "0.1.0"
     pullPolicy: IfNotPresent
 

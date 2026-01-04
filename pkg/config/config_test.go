@@ -264,17 +264,108 @@ func TestIsExternalMode(t *testing.T) {
 	}
 }
 
-func TestGetNBDBAddress_Standalone(t *testing.T) {
+// Tests for GetNBDBAddress/GetSBDBAddress - Requirements 1.1, 1.2, 1.3, 1.4
+
+func TestGetNBDBAddress_EmptyReturnsDefaultUnixSocket(t *testing.T) {
+	// Test that empty address returns default Unix socket (Requirement 1.3)
 	cfg := DefaultConfig()
-	cfg.OVN.Mode = "standalone"
+	cfg.OVN.NBDBAddress = ""
 
 	addr := cfg.GetNBDBAddress()
-	if addr != "unix:/var/run/ovn/ovnnb_db.sock" {
-		t.Errorf("expected unix socket path, got '%s'", addr)
+	expected := "unix:/var/run/ovn/ovnnb_db.sock"
+	if addr != expected {
+		t.Errorf("expected '%s', got '%s'", expected, addr)
 	}
 }
 
-func TestGetNBDBAddress_External(t *testing.T) {
+func TestGetSBDBAddress_EmptyReturnsDefaultUnixSocket(t *testing.T) {
+	// Test that empty address returns default Unix socket (Requirement 1.4)
+	cfg := DefaultConfig()
+	cfg.OVN.SBDBAddress = ""
+
+	addr := cfg.GetSBDBAddress()
+	expected := "unix:/var/run/ovn/ovnsb_db.sock"
+	if addr != expected {
+		t.Errorf("expected '%s', got '%s'", expected, addr)
+	}
+}
+
+func TestGetNBDBAddress_ConfiguredAddressReturned(t *testing.T) {
+	// Test that configured address is returned unchanged (Requirement 1.1)
+	testCases := []struct {
+		name    string
+		address string
+	}{
+		{"tcp address", "tcp:192.168.1.100:6641"},
+		{"ssl address", "ssl:10.0.0.1:6641"},
+		{"unix socket", "unix:/custom/path/ovnnb_db.sock"},
+		{"multiple addresses", "tcp:192.168.1.100:6641,tcp:192.168.1.101:6641"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.OVN.NBDBAddress = tc.address
+
+			addr := cfg.GetNBDBAddress()
+			if addr != tc.address {
+				t.Errorf("expected '%s', got '%s'", tc.address, addr)
+			}
+		})
+	}
+}
+
+func TestGetSBDBAddress_ConfiguredAddressReturned(t *testing.T) {
+	// Test that configured address is returned unchanged (Requirement 1.2)
+	testCases := []struct {
+		name    string
+		address string
+	}{
+		{"tcp address", "tcp:192.168.1.100:6642"},
+		{"ssl address", "ssl:10.0.0.1:6642"},
+		{"unix socket", "unix:/custom/path/ovnsb_db.sock"},
+		{"multiple addresses", "tcp:192.168.1.100:6642,tcp:192.168.1.101:6642"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.OVN.SBDBAddress = tc.address
+
+			addr := cfg.GetSBDBAddress()
+			if addr != tc.address {
+				t.Errorf("expected '%s', got '%s'", tc.address, addr)
+			}
+		})
+	}
+}
+
+func TestGetNBDBAddress_StandaloneModeWithConfiguredAddress(t *testing.T) {
+	// Test that configured address is returned even in standalone mode (Requirement 1.1)
+	cfg := DefaultConfig()
+	cfg.OVN.Mode = "standalone"
+	cfg.OVN.NBDBAddress = "tcp:127.0.0.1:6641"
+
+	addr := cfg.GetNBDBAddress()
+	if addr != "tcp:127.0.0.1:6641" {
+		t.Errorf("expected 'tcp:127.0.0.1:6641', got '%s'", addr)
+	}
+}
+
+func TestGetSBDBAddress_StandaloneModeWithConfiguredAddress(t *testing.T) {
+	// Test that configured address is returned even in standalone mode (Requirement 1.2)
+	cfg := DefaultConfig()
+	cfg.OVN.Mode = "standalone"
+	cfg.OVN.SBDBAddress = "tcp:127.0.0.1:6642"
+
+	addr := cfg.GetSBDBAddress()
+	if addr != "tcp:127.0.0.1:6642" {
+		t.Errorf("expected 'tcp:127.0.0.1:6642', got '%s'", addr)
+	}
+}
+
+func TestGetNBDBAddress_ExternalModeWithConfiguredAddress(t *testing.T) {
+	// Test that configured address is returned in external mode (Requirement 1.1)
 	cfg := DefaultConfig()
 	cfg.OVN.Mode = "external"
 	cfg.OVN.NBDBAddress = "tcp:192.168.1.100:6641"
@@ -282,6 +373,178 @@ func TestGetNBDBAddress_External(t *testing.T) {
 	addr := cfg.GetNBDBAddress()
 	if addr != "tcp:192.168.1.100:6641" {
 		t.Errorf("expected 'tcp:192.168.1.100:6641', got '%s'", addr)
+	}
+}
+
+func TestGetSBDBAddress_ExternalModeWithConfiguredAddress(t *testing.T) {
+	// Test that configured address is returned in external mode (Requirement 1.2)
+	cfg := DefaultConfig()
+	cfg.OVN.Mode = "external"
+	cfg.OVN.SBDBAddress = "tcp:192.168.1.100:6642"
+
+	addr := cfg.GetSBDBAddress()
+	if addr != "tcp:192.168.1.100:6642" {
+		t.Errorf("expected 'tcp:192.168.1.100:6642', got '%s'", addr)
+	}
+}
+
+func TestGetNBDBAddress_StandaloneModeEmptyAddress(t *testing.T) {
+	// Test that empty address in standalone mode returns Unix socket (Requirement 1.3)
+	cfg := DefaultConfig()
+	cfg.OVN.Mode = "standalone"
+	cfg.OVN.NBDBAddress = ""
+
+	addr := cfg.GetNBDBAddress()
+	if addr != "unix:/var/run/ovn/ovnnb_db.sock" {
+		t.Errorf("expected unix socket path, got '%s'", addr)
+	}
+}
+
+func TestGetSBDBAddress_StandaloneModeEmptyAddress(t *testing.T) {
+	// Test that empty address in standalone mode returns Unix socket (Requirement 1.4)
+	cfg := DefaultConfig()
+	cfg.OVN.Mode = "standalone"
+	cfg.OVN.SBDBAddress = ""
+
+	addr := cfg.GetSBDBAddress()
+	if addr != "unix:/var/run/ovn/ovnsb_db.sock" {
+		t.Errorf("expected unix socket path, got '%s'", addr)
+	}
+}
+
+// Tests for environment variable precedence - Requirements 2.1, 2.2, 2.3, 2.4
+
+func TestApplyEnvOverrides_OVN_NB_DB_OverridesConfig(t *testing.T) {
+	// Test that OVN_NB_DB overrides config file value (Requirement 2.1)
+	os.Setenv("OVN_NB_DB", "tcp:10.0.0.50:6641")
+	defer os.Unsetenv("OVN_NB_DB")
+
+	cfg := DefaultConfig()
+	cfg.OVN.NBDBAddress = "tcp:192.168.1.100:6641" // Config file value
+	cfg.ApplyEnvOverrides()
+
+	if cfg.OVN.NBDBAddress != "tcp:10.0.0.50:6641" {
+		t.Errorf("expected OVN_NB_DB to override config, got '%s'", cfg.OVN.NBDBAddress)
+	}
+}
+
+func TestApplyEnvOverrides_OVN_SB_DB_OverridesConfig(t *testing.T) {
+	// Test that OVN_SB_DB overrides config file value (Requirement 2.2)
+	os.Setenv("OVN_SB_DB", "tcp:10.0.0.50:6642")
+	defer os.Unsetenv("OVN_SB_DB")
+
+	cfg := DefaultConfig()
+	cfg.OVN.SBDBAddress = "tcp:192.168.1.100:6642" // Config file value
+	cfg.ApplyEnvOverrides()
+
+	if cfg.OVN.SBDBAddress != "tcp:10.0.0.50:6642" {
+		t.Errorf("expected OVN_SB_DB to override config, got '%s'", cfg.OVN.SBDBAddress)
+	}
+}
+
+func TestApplyEnvOverrides_ZSTACK_OVN_NBDB_TakesPrecedence(t *testing.T) {
+	// Test that ZSTACK_OVN_NBDB_ADDRESS takes precedence over OVN_NB_DB (Requirement 2.3)
+	os.Setenv("ZSTACK_OVN_NBDB_ADDRESS", "tcp:172.16.0.1:6641")
+	os.Setenv("OVN_NB_DB", "tcp:10.0.0.50:6641")
+	defer func() {
+		os.Unsetenv("ZSTACK_OVN_NBDB_ADDRESS")
+		os.Unsetenv("OVN_NB_DB")
+	}()
+
+	cfg := DefaultConfig()
+	cfg.ApplyEnvOverrides()
+
+	if cfg.OVN.NBDBAddress != "tcp:172.16.0.1:6641" {
+		t.Errorf("expected ZSTACK_OVN_NBDB_ADDRESS to take precedence, got '%s'", cfg.OVN.NBDBAddress)
+	}
+}
+
+func TestApplyEnvOverrides_ZSTACK_OVN_SBDB_TakesPrecedence(t *testing.T) {
+	// Test that ZSTACK_OVN_SBDB_ADDRESS takes precedence over OVN_SB_DB (Requirement 2.4)
+	os.Setenv("ZSTACK_OVN_SBDB_ADDRESS", "tcp:172.16.0.1:6642")
+	os.Setenv("OVN_SB_DB", "tcp:10.0.0.50:6642")
+	defer func() {
+		os.Unsetenv("ZSTACK_OVN_SBDB_ADDRESS")
+		os.Unsetenv("OVN_SB_DB")
+	}()
+
+	cfg := DefaultConfig()
+	cfg.ApplyEnvOverrides()
+
+	if cfg.OVN.SBDBAddress != "tcp:172.16.0.1:6642" {
+		t.Errorf("expected ZSTACK_OVN_SBDB_ADDRESS to take precedence, got '%s'", cfg.OVN.SBDBAddress)
+	}
+}
+
+func TestApplyEnvOverrides_OnlyOVN_NB_DB_Set(t *testing.T) {
+	// Test that OVN_NB_DB is used when ZSTACK_OVN_NBDB_ADDRESS is not set (Requirement 2.1)
+	os.Setenv("OVN_NB_DB", "tcp:10.0.0.100:6641")
+	defer os.Unsetenv("OVN_NB_DB")
+
+	cfg := DefaultConfig()
+	cfg.ApplyEnvOverrides()
+
+	if cfg.OVN.NBDBAddress != "tcp:10.0.0.100:6641" {
+		t.Errorf("expected OVN_NB_DB value, got '%s'", cfg.OVN.NBDBAddress)
+	}
+}
+
+func TestApplyEnvOverrides_OnlyOVN_SB_DB_Set(t *testing.T) {
+	// Test that OVN_SB_DB is used when ZSTACK_OVN_SBDB_ADDRESS is not set (Requirement 2.2)
+	os.Setenv("OVN_SB_DB", "tcp:10.0.0.100:6642")
+	defer os.Unsetenv("OVN_SB_DB")
+
+	cfg := DefaultConfig()
+	cfg.ApplyEnvOverrides()
+
+	if cfg.OVN.SBDBAddress != "tcp:10.0.0.100:6642" {
+		t.Errorf("expected OVN_SB_DB value, got '%s'", cfg.OVN.SBDBAddress)
+	}
+}
+
+func TestApplyEnvOverrides_NoEnvVars_KeepsConfigValue(t *testing.T) {
+	// Test that config value is preserved when no env vars are set
+	// Clear any existing env vars
+	os.Unsetenv("ZSTACK_OVN_NBDB_ADDRESS")
+	os.Unsetenv("ZSTACK_OVN_SBDB_ADDRESS")
+	os.Unsetenv("OVN_NB_DB")
+	os.Unsetenv("OVN_SB_DB")
+
+	cfg := DefaultConfig()
+	cfg.OVN.NBDBAddress = "tcp:192.168.1.100:6641"
+	cfg.OVN.SBDBAddress = "tcp:192.168.1.100:6642"
+	cfg.ApplyEnvOverrides()
+
+	if cfg.OVN.NBDBAddress != "tcp:192.168.1.100:6641" {
+		t.Errorf("expected config value preserved for NBDBAddress, got '%s'", cfg.OVN.NBDBAddress)
+	}
+	if cfg.OVN.SBDBAddress != "tcp:192.168.1.100:6642" {
+		t.Errorf("expected config value preserved for SBDBAddress, got '%s'", cfg.OVN.SBDBAddress)
+	}
+}
+
+func TestApplyEnvOverrides_EmptyZSTACK_FallsBackToOVN(t *testing.T) {
+	// Test that empty ZSTACK_OVN_* falls back to OVN_* env vars
+	os.Setenv("ZSTACK_OVN_NBDB_ADDRESS", "")
+	os.Setenv("OVN_NB_DB", "tcp:10.0.0.200:6641")
+	os.Setenv("ZSTACK_OVN_SBDB_ADDRESS", "")
+	os.Setenv("OVN_SB_DB", "tcp:10.0.0.200:6642")
+	defer func() {
+		os.Unsetenv("ZSTACK_OVN_NBDB_ADDRESS")
+		os.Unsetenv("OVN_NB_DB")
+		os.Unsetenv("ZSTACK_OVN_SBDB_ADDRESS")
+		os.Unsetenv("OVN_SB_DB")
+	}()
+
+	cfg := DefaultConfig()
+	cfg.ApplyEnvOverrides()
+
+	// Empty ZSTACK_OVN_* should fall back to OVN_*
+	if cfg.OVN.NBDBAddress != "tcp:10.0.0.200:6641" {
+		t.Errorf("expected OVN_NB_DB fallback, got '%s'", cfg.OVN.NBDBAddress)
+	}
+	if cfg.OVN.SBDBAddress != "tcp:10.0.0.200:6642" {
+		t.Errorf("expected OVN_SB_DB fallback, got '%s'", cfg.OVN.SBDBAddress)
 	}
 }
 
