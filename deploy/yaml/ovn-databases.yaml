@@ -6,6 +6,8 @@
 # the external OVN database addresses in the configmap.
 ---
 # OVN Northbound Database Service
+# Using ClusterIP None (headless) since pods use hostNetwork
+# Clients should connect via node IP directly
 apiVersion: v1
 kind: Service
 metadata:
@@ -16,6 +18,7 @@ metadata:
     app.kubernetes.io/component: ovn-nb-db
 spec:
   type: ClusterIP
+  clusterIP: None
   ports:
     - name: nb-db
       port: 6641
@@ -52,13 +55,12 @@ spec:
         app.kubernetes.io/name: zstack-ovn-kubernetes
         app.kubernetes.io/component: ovn-nb-db
     spec:
+      # Use host network to avoid chicken-and-egg problem with CNI
+      hostNetwork: true
+      # Use Default DNS policy - ClusterFirstWithHostNet may fail before CNI is ready
+      dnsPolicy: Default
       tolerations:
-        - key: node-role.kubernetes.io/control-plane
-          operator: Exists
-          effect: NoSchedule
-        - key: node-role.kubernetes.io/master
-          operator: Exists
-          effect: NoSchedule
+        - operator: "Exists"
       affinity:
         nodeAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -133,6 +135,8 @@ spec:
           emptyDir: {}
 ---
 # OVN Southbound Database Service
+# Using ClusterIP None (headless) since pods use hostNetwork
+# Clients should connect via node IP directly
 apiVersion: v1
 kind: Service
 metadata:
@@ -143,6 +147,7 @@ metadata:
     app.kubernetes.io/component: ovn-sb-db
 spec:
   type: ClusterIP
+  clusterIP: None
   ports:
     - name: sb-db
       port: 6642
@@ -179,13 +184,12 @@ spec:
         app.kubernetes.io/name: zstack-ovn-kubernetes
         app.kubernetes.io/component: ovn-sb-db
     spec:
+      # Use host network to avoid chicken-and-egg problem with CNI
+      hostNetwork: true
+      # Use Default DNS policy - ClusterFirstWithHostNet may fail before CNI is ready
+      dnsPolicy: Default
       tolerations:
-        - key: node-role.kubernetes.io/control-plane
-          operator: Exists
-          effect: NoSchedule
-        - key: node-role.kubernetes.io/master
-          operator: Exists
-          effect: NoSchedule
+        - operator: "Exists"
       affinity:
         nodeAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -282,13 +286,12 @@ spec:
         app.kubernetes.io/name: zstack-ovn-kubernetes
         app.kubernetes.io/component: ovn-northd
     spec:
+      # Use host network to avoid chicken-and-egg problem with CNI
+      hostNetwork: true
+      # Use Default DNS policy with hostNetwork - ClusterFirstWithHostNet may fail before CNI is ready
+      dnsPolicy: Default
       tolerations:
-        - key: node-role.kubernetes.io/control-plane
-          operator: Exists
-          effect: NoSchedule
-        - key: node-role.kubernetes.io/master
-          operator: Exists
-          effect: NoSchedule
+        - operator: "Exists"
       affinity:
         nodeAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -297,7 +300,12 @@ spec:
                 matchExpressions:
                   - key: node-role.kubernetes.io/control-plane
                     operator: Exists
-
+          # Must run on the same node as OVN NB/SB databases
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: Exists
       # Wait for NB and SB databases to be ready
       initContainers:
         - name: wait-for-dbs
@@ -308,15 +316,16 @@ spec:
             - -c
             - |
               set -ex
-              echo "Waiting for OVN NB DB to be ready..."
-              until ovsdb-client list-dbs tcp:ovn-nb-db.zstack-ovn-kubernetes.svc.cluster.local:6641 2>/dev/null | grep -q OVN_Northbound; do
+              # Use localhost since we're on the same node as the DBs (hostNetwork)
+              echo "Waiting for OVN NB DB to be ready on localhost..."
+              until ovsdb-client list-dbs tcp:127.0.0.1:6641 2>/dev/null | grep -q OVN_Northbound; do
                 echo "NB DB not ready, waiting..."
                 sleep 2
               done
               echo "NB DB is ready!"
               
-              echo "Waiting for OVN SB DB to be ready..."
-              until ovsdb-client list-dbs tcp:ovn-sb-db.zstack-ovn-kubernetes.svc.cluster.local:6642 2>/dev/null | grep -q OVN_Southbound; do
+              echo "Waiting for OVN SB DB to be ready on localhost..."
+              until ovsdb-client list-dbs tcp:127.0.0.1:6642 2>/dev/null | grep -q OVN_Southbound; do
                 echo "SB DB not ready, waiting..."
                 sleep 2
               done
@@ -332,8 +341,9 @@ spec:
             - |
               set -ex
               
-              OVN_NB_DB="tcp:ovn-nb-db.zstack-ovn-kubernetes.svc.cluster.local:6641"
-              OVN_SB_DB="tcp:ovn-sb-db.zstack-ovn-kubernetes.svc.cluster.local:6642"
+              # Use localhost since we're on the same node as the DBs (hostNetwork)
+              OVN_NB_DB="tcp:127.0.0.1:6641"
+              OVN_SB_DB="tcp:127.0.0.1:6642"
               
               echo "Starting OVN northd..."
               echo "NB DB: ${OVN_NB_DB}"
@@ -347,9 +357,9 @@ spec:
                 --no-chdir
           env:
             - name: OVN_NB_DB
-              value: "tcp:ovn-nb-db.zstack-ovn-kubernetes.svc.cluster.local:6641"
+              value: "tcp:127.0.0.1:6641"
             - name: OVN_SB_DB
-              value: "tcp:ovn-sb-db.zstack-ovn-kubernetes.svc.cluster.local:6642"
+              value: "tcp:127.0.0.1:6642"
           volumeMounts:
             - name: ovn-run
               mountPath: /var/run/ovn

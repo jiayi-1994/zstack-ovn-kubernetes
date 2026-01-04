@@ -31,6 +31,9 @@ spec:
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
     spec:
       serviceAccountName: {{ include "zstack-ovn-kubernetes.controller.serviceAccountName" . }}
+      # Use host network to avoid chicken-and-egg problem with CNI
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
       
       # Prefer running on control-plane nodes
       tolerations:
@@ -38,6 +41,10 @@ spec:
           operator: Exists
           effect: NoSchedule
         - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+        # Tolerate not-ready nodes during bootstrap
+        - key: node.kubernetes.io/not-ready
           operator: Exists
           effect: NoSchedule
       affinity:

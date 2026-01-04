@@ -390,7 +390,7 @@ var _ = Describe("Pod Network Connectivity", func() {
 			By("Getting service ClusterIP")
 			clusterIP, err := f.GetServiceClusterIP(ctx, namespace, serviceName)
 			Expect(err).NotTo(HaveOccurred())
-			fmt.Println("123456")
+			fmt.Println("1234567")
 			By("Testing multiple connections to verify load balancing")
 			// Make multiple connections to verify the service is accessible
 			for i := 0; i < 5; i++ {

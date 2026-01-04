@@ -266,10 +266,17 @@ jobs:
           # 3. Apply RBAC
           kubectl apply -f deploy/yaml/rbac.yaml
           
-          # 4. Apply ConfigMap with standalone settings
-          kubectl apply -f deploy/yaml/configmap.yaml
+          # 4. Get control-plane node IP for OVN DB address
+          CONTROL_PLANE_IP=$(docker inspect -f '{{.NetworkSettings.Networks.kind.IPAddress}}' e2e-standalone-control-plane)
+          echo "Control plane IP: $CONTROL_PLANE_IP"
           
-          # 5. Deploy OVN databases (standalone mode)
+          # 5. Apply ConfigMap with updated OVN DB addresses
+          # Replace the service DNS names with actual control-plane IP
+          sed -e "s|tcp:ovn-nb-db.zstack-ovn-kubernetes.svc.cluster.local:6641|tcp:${CONTROL_PLANE_IP}:6641|g" \
+              -e "s|tcp:ovn-sb-db.zstack-ovn-kubernetes.svc.cluster.local:6642|tcp:${CONTROL_PLANE_IP}:6642|g" \
+              deploy/yaml/configmap.yaml | kubectl apply -f -
+          
+          # 6. Deploy OVN databases (standalone mode)
           kubectl apply -f deploy/yaml/ovn-databases.yaml
           
           # Wait for OVN databases to be ready
@@ -277,11 +284,14 @@ jobs:
           sleep 30
           kubectl -n zstack-ovn-kubernetes get pods || true
           
-          # 6. Deploy controller (with e2e image tag)
+          # 7. Deploy controller (with e2e image tag)
           sed 's/:0.1.0/:e2e/g' deploy/yaml/controller-deployment.yaml | kubectl apply -f -
           
-          # 7. Deploy node agent (with e2e image tag)
-          sed 's/:0.1.0/:e2e/g' deploy/yaml/node-daemonset.yaml | kubectl apply -f -
+          # 8. Deploy node agent (with e2e image tag and updated OVN DB addresses)
+          sed -e 's/:0.1.0/:e2e/g' \
+              -e "s|tcp:ovn-nb-db.zstack-ovn-kubernetes.svc.cluster.local:6641|tcp:${CONTROL_PLANE_IP}:6641|g" \
+              -e "s|tcp:ovn-sb-db.zstack-ovn-kubernetes.svc.cluster.local:6642|tcp:${CONTROL_PLANE_IP}:6642|g" \
+              deploy/yaml/node-daemonset.yaml | kubectl apply -f -
           
           # Wait for all pods to be ready
           sleep 30
@@ -442,10 +452,16 @@ jobs:
           # 3. RBAC
           kubectl apply -f deploy/yaml/rbac.yaml
           
-          # 4. ConfigMap
-          kubectl apply -f deploy/yaml/configmap.yaml
+          # 4. Get control-plane node IP for OVN DB address
+          CONTROL_PLANE_IP=$(docker inspect -f '{{.NetworkSettings.Networks.kind.IPAddress}}' e2e-connectivity-control-plane)
+          echo "Control plane IP: $CONTROL_PLANE_IP"
           
-          # 5. OVN databases (standalone mode)
+          # 5. ConfigMap with updated OVN DB addresses
+          sed -e "s|tcp:ovn-nb-db.zstack-ovn-kubernetes.svc.cluster.local:6641|tcp:${CONTROL_PLANE_IP}:6641|g" \
+              -e "s|tcp:ovn-sb-db.zstack-ovn-kubernetes.svc.cluster.local:6642|tcp:${CONTROL_PLANE_IP}:6642|g" \
+              deploy/yaml/configmap.yaml | kubectl apply -f -
+          
+          # 6. OVN databases (standalone mode)
           kubectl apply -f deploy/yaml/ovn-databases.yaml
           
           # Wait for OVN databases to be ready
@@ -453,11 +469,14 @@ jobs:
           sleep 30
           kubectl -n zstack-ovn-kubernetes get pods || true
           
-          # 6. Controller (with e2e image tag)
+          # 7. Controller (with e2e image tag)
           sed 's/:0.1.0/:e2e/g' deploy/yaml/controller-deployment.yaml | kubectl apply -f -
           
-          # 7. Node DaemonSet (with e2e image tag)
-          sed 's/:0.1.0/:e2e/g' deploy/yaml/node-daemonset.yaml | kubectl apply -f -
+          # 8. Node DaemonSet (with e2e image tag and updated OVN DB addresses)
+          sed -e 's/:0.1.0/:e2e/g' \
+              -e "s|tcp:ovn-nb-db.zstack-ovn-kubernetes.svc.cluster.local:6641|tcp:${CONTROL_PLANE_IP}:6641|g" \
+              -e "s|tcp:ovn-sb-db.zstack-ovn-kubernetes.svc.cluster.local:6642|tcp:${CONTROL_PLANE_IP}:6642|g" \
+              deploy/yaml/node-daemonset.yaml | kubectl apply -f -
           
           # Wait for all pods to be ready
           sleep 60

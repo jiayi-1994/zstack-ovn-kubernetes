@@ -222,11 +222,18 @@ spec:
         {{- include "zstack-ovn-kubernetes.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: ovn-sb-db
     spec:
+      # Use host network to avoid chicken-and-egg problem with CNI
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
       tolerations:
         - key: node-role.kubernetes.io/control-plane
           operator: Exists
           effect: NoSchedule
         - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+        # Tolerate not-ready nodes during bootstrap
+        - key: node.kubernetes.io/not-ready
           operator: Exists
           effect: NoSchedule
       affinity:

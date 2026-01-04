@@ -33,7 +33,10 @@ spec:
       serviceAccountName: zstack-ovn-kubernetes-node
       hostNetwork: true
       hostPID: true
-      dnsPolicy: ClusterFirstWithHostNet
+      # Use Default DNS policy - ClusterFirstWithHostNet may fail before CNI is ready
+      dnsPolicy: Default
+      # Priority class for CNI components
+      priorityClassName: system-node-critical
       
       # Run on all nodes including control-plane
       tolerations:
@@ -100,7 +103,10 @@ spec:
               echo "Setting OVS external-ids for hostname: ${HOSTNAME}"
               ovs-vsctl set open . external-ids:system-id="${HOSTNAME}"
               ovs-vsctl set open . external-ids:hostname="${HOSTNAME}"
-              ovs-vsctl set open . external-ids:ovn-remote="tcp:ovn-sb-db.zstack-ovn-kubernetes.svc.cluster.local:6642"
+              
+              # Use the OVN_SB_DB environment variable for ovn-remote
+              echo "Setting OVN remote: ${OVN_SB_DB}"
+              ovs-vsctl set open . external-ids:ovn-remote="${OVN_SB_DB}"
               ovs-vsctl set open . external-ids:ovn-encap-type="vxlan"
               
               # Get node IP for encapsulation
@@ -109,6 +115,10 @@ spec:
               ovs-vsctl set open . external-ids:ovn-encap-ip="${NODE_IP}"
               
               echo "OVS initialization complete!"
+          env:
+            # OVN SB DB address - will be replaced by E2E workflow with actual control-plane IP
+            - name: OVN_SB_DB
+              value: "tcp:ovn-sb-db.zstack-ovn-kubernetes.svc.cluster.local:6642"
           volumeMounts:
             - name: host-var-run-ovs
               mountPath: /var/run/openvswitch
@@ -139,6 +149,9 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            # OVN DB addresses - these should be updated to point to the actual OVN DB location
+            # In standalone mode, OVN DBs run on control-plane node
+            # The E2E workflow will replace these with actual control-plane IP
             - name: OVN_NB_DB
               value: "tcp:ovn-nb-db.zstack-ovn-kubernetes.svc.cluster.local:6641"
             - name: OVN_SB_DB
