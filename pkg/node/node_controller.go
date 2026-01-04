@@ -65,6 +65,7 @@ const (
 // - Allocate per-node subnets from cluster CIDR
 // - Create node-level Logical Switches in OVN
 // - Create Cluster Router and Router Ports for L3 connectivity
+// - Configure distributed gateway for external access
 // - Configure tunnel endpoints for cross-node communication
 // - Manage gateway configuration and NAT rules
 //
@@ -100,6 +101,15 @@ type NodeController struct {
 
 	// clusterRouterInitialized tracks if cluster router has been created
 	clusterRouterInitialized bool
+
+	// joinNetworkInitialized tracks if join network has been created
+	joinNetworkInitialized bool
+
+	// gatewayNodeIP tracks the current gateway node's IP for SNAT
+	gatewayNodeIP string
+
+	// nextJoinIP tracks the next available IP on join network (100.64.0.x)
+	nextJoinIP int
 }
 
 // ClusterSubnetAllocator manages allocation of per-node subnets from the cluster CIDR.
@@ -342,6 +352,7 @@ func NewNodeController(
 		clusterSubnetAllocator: clusterAllocator,
 		recorder:               recorder,
 		nodeSubnets:            make(map[string]string),
+		nextJoinIP:             2, // Start from 100.64.0.2 (100.64.0.1 is router)
 	}, nil
 }
 
@@ -443,18 +454,25 @@ func (c *NodeController) handleNodeDelete(ctx context.Context, nodeName string) 
 //
 // Steps:
 // 1. Ensure cluster router exists
-// 2. Check if node already has a subnet annotation
-// 3. If not, allocate a new subnet
-// 4. Create or update the node's Logical Switch in OVN
-// 5. Create Router Port connecting switch to cluster router
-// 6. Configure SNAT for external access
-// 7. Update node annotations
+// 2. Ensure join network exists (for distributed gateway)
+// 3. Check if node already has a subnet annotation
+// 4. If not, allocate a new subnet
+// 5. Create or update the node's Logical Switch in OVN
+// 6. Create Router Port connecting switch to cluster router
+// 7. Configure distributed gateway for external access
+// 8. Update node annotations
 func (c *NodeController) handleNodeCreateOrUpdate(ctx context.Context, node *corev1.Node) (ctrl.Result, error) {
 	klog.V(4).Infof("Handling create/update of Node %s", node.Name)
 
 	// Ensure cluster router exists (only once)
 	if err := c.ensureClusterRouter(ctx); err != nil {
 		klog.Errorf("Failed to ensure cluster router: %v", err)
+		return ctrl.Result{}, err
+	}
+
+	// Ensure join network exists for distributed gateway
+	if err := c.ensureJoinNetwork(ctx); err != nil {
+		klog.Errorf("Failed to ensure join network: %v", err)
 		return ctrl.Result{}, err
 	}
 
@@ -514,11 +532,11 @@ func (c *NodeController) handleNodeCreateOrUpdate(ctx context.Context, node *cor
 		return ctrl.Result{}, err
 	}
 
-	// Configure SNAT for external access
-	if err := c.ensureSNAT(ctx, node, subnet); err != nil {
-		klog.Errorf("Failed to ensure SNAT for node %s: %v", node.Name, err)
-		// Don't fail the reconciliation for SNAT errors
-		klog.Warningf("SNAT configuration failed, external access may not work: %v", err)
+	// Configure distributed gateway for this node
+	if err := c.ensureDistributedGateway(ctx, node); err != nil {
+		klog.Errorf("Failed to ensure distributed gateway for node %s: %v", node.Name, err)
+		// Don't fail the reconciliation for gateway errors
+		klog.Warningf("Distributed gateway configuration failed, external access may not work: %v", err)
 	}
 
 	// Update node annotations
@@ -727,6 +745,109 @@ func (c *NodeController) ensureClusterRouter(ctx context.Context) error {
 	return nil
 }
 
+// ensureJoinNetwork creates the join switch and router port for distributed gateway.
+// The join network (100.64.0.0/16) connects the cluster router to gateway chassis.
+func (c *NodeController) ensureJoinNetwork(ctx context.Context) error {
+	c.mu.Lock()
+	if c.joinNetworkInitialized {
+		c.mu.Unlock()
+		return nil
+	}
+	c.mu.Unlock()
+
+	if c.ovnClient == nil || !c.ovnClient.IsConnected() {
+		klog.V(4).Info("OVN client not connected, skipping join network creation")
+		return nil
+	}
+
+	if c.lrOps == nil {
+		return fmt.Errorf("logical router ops not initialized")
+	}
+
+	// Create join switch
+	if err := c.lrOps.EnsureJoinSwitch(ctx); err != nil {
+		return fmt.Errorf("failed to create join switch: %w", err)
+	}
+
+	// Create router port connecting to join switch
+	if err := c.lrOps.EnsureJoinRouterPort(ctx); err != nil {
+		return fmt.Errorf("failed to create join router port: %w", err)
+	}
+
+	c.mu.Lock()
+	c.joinNetworkInitialized = true
+	c.mu.Unlock()
+
+	klog.Info("Join network initialized for distributed gateway")
+	return nil
+}
+
+// ensureDistributedGateway configures the distributed gateway for a node.
+// Each node acts as a gateway chassis, allowing pods to access external networks
+// through the node's physical IP.
+//
+// This creates:
+// 1. A gateway chassis port on the join switch bound to this node
+// 2. A default route pointing to the first gateway chassis
+// 3. SNAT rules for the cluster CIDR
+func (c *NodeController) ensureDistributedGateway(ctx context.Context, node *corev1.Node) error {
+	if c.ovnClient == nil || !c.ovnClient.IsConnected() {
+		klog.V(4).Infof("OVN client not connected, skipping gateway configuration for node %s", node.Name)
+		return nil
+	}
+
+	if c.lrOps == nil {
+		return fmt.Errorf("logical router ops not initialized")
+	}
+
+	// Get node's internal IP
+	nodeIP := c.getNodeInternalIP(node)
+	if nodeIP == "" {
+		klog.Warningf("No internal IP found for node %s, skipping gateway configuration", node.Name)
+		return nil
+	}
+
+	// Get chassis name (usually same as node name or hostname)
+	chassisName := node.Name
+
+	// Allocate join network IP for this node (100.64.0.x)
+	c.mu.Lock()
+	joinIP := fmt.Sprintf("100.64.0.%d", c.nextJoinIP)
+	c.nextJoinIP++
+	c.mu.Unlock()
+
+	// Create gateway chassis port on join switch
+	if err := c.lrOps.EnsureGatewayChassisPort(ctx, node.Name, chassisName, joinIP, nodeIP); err != nil {
+		return fmt.Errorf("failed to create gateway chassis port: %w", err)
+	}
+
+	// Set up default route and SNAT (only for first node / gateway node)
+	c.mu.Lock()
+	isFirstGateway := c.gatewayNodeIP == ""
+	if isFirstGateway {
+		c.gatewayNodeIP = nodeIP
+	}
+	c.mu.Unlock()
+
+	if isFirstGateway {
+		// Add default route pointing to this gateway chassis
+		if err := c.lrOps.EnsureDefaultRoute(ctx, joinIP); err != nil {
+			return fmt.Errorf("failed to add default route: %w", err)
+		}
+
+		// Add SNAT rule for cluster CIDR
+		if err := c.lrOps.EnsureSNATForCluster(ctx, nodeIP, c.config.Network.ClusterCIDR); err != nil {
+			return fmt.Errorf("failed to add cluster SNAT: %w", err)
+		}
+
+		klog.Infof("Node %s configured as primary gateway with IP %s", node.Name, nodeIP)
+	} else {
+		klog.Infof("Node %s configured as backup gateway chassis", node.Name)
+	}
+
+	return nil
+}
+
 // ensureRouterPort creates or updates the router port connecting a node's switch to the cluster router.
 func (c *NodeController) ensureRouterPort(ctx context.Context, node *corev1.Node, subnet *net.IPNet, gatewayIP net.IP) error {
 	if c.ovnClient == nil || !c.ovnClient.IsConnected() {
@@ -756,39 +877,6 @@ func (c *NodeController) ensureRouterPort(ctx context.Context, node *corev1.Node
 	}
 
 	klog.Infof("Ensured router port for node %s connecting to cluster router", node.Name)
-	return nil
-}
-
-// ensureSNAT configures SNAT rules for a node's subnet to enable external access.
-func (c *NodeController) ensureSNAT(ctx context.Context, node *corev1.Node, subnet *net.IPNet) error {
-	if c.ovnClient == nil || !c.ovnClient.IsConnected() {
-		klog.V(4).Infof("OVN client not connected, skipping SNAT configuration for node %s", node.Name)
-		return nil
-	}
-
-	if c.lrOps == nil {
-		return fmt.Errorf("logical router ops not initialized")
-	}
-
-	// Get node's internal IP for SNAT
-	nodeIP := c.getNodeInternalIP(node)
-	if nodeIP == "" {
-		klog.Warningf("No internal IP found for node %s, skipping SNAT", node.Name)
-		return nil
-	}
-
-	// Add SNAT rule: subnet -> nodeIP
-	// This allows pods to access external networks using the node's IP
-	if err := c.lrOps.AddNAT(ctx, ovndb.NATTypeSNAT, nodeIP, subnet.String()); err != nil {
-		// Ignore duplicate errors
-		if !isDuplicateError(err) {
-			return fmt.Errorf("failed to add SNAT rule: %w", err)
-		}
-		klog.V(4).Infof("SNAT rule already exists for subnet %s", subnet.String())
-	} else {
-		klog.Infof("Added SNAT rule for node %s: %s -> %s", node.Name, subnet.String(), nodeIP)
-	}
-
 	return nil
 }
 
