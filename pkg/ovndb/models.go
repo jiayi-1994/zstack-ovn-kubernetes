@@ -56,19 +56,6 @@ type LogicalSwitch struct {
 	Copp              *string           `ovsdb:"copp"`
 }
 
-// Index returns the index for LogicalSwitch (name is the primary index)
-func (ls *LogicalSwitch) Index() []model.ClientIndex {
-	return []model.ClientIndex{
-		{
-			Columns: []model.ColumnKey{
-				{
-					Column: "name",
-				},
-			},
-		},
-	}
-}
-
 // LogicalSwitchPort represents an OVN Logical Switch Port
 // A logical switch port is a virtual network interface attached to a logical switch.
 // In Kubernetes context, each Pod has a logical switch port.
@@ -98,19 +85,6 @@ type LogicalSwitchPort struct {
 	ParentName       *string           `ovsdb:"parent_name"`
 	Tag              *int              `ovsdb:"tag"`
 	TagRequest       *int              `ovsdb:"tag_request"`
-}
-
-// Index returns the index for LogicalSwitchPort (name is the primary index)
-func (lsp *LogicalSwitchPort) Index() []model.ClientIndex {
-	return []model.ClientIndex{
-		{
-			Columns: []model.ColumnKey{
-				{
-					Column: "name",
-				},
-			},
-		},
-	}
 }
 
 // LogicalRouter represents an OVN Logical Router
@@ -164,19 +138,6 @@ type LoadBalancer struct {
 	HealthCheck     []string          `ovsdb:"health_check"`
 	IPPortMappings  map[string]string `ovsdb:"ip_port_mappings"`
 	SelectionFields []string          `ovsdb:"selection_fields"`
-}
-
-// Index returns the index for LoadBalancer (name is the primary index)
-func (lb *LoadBalancer) Index() []model.ClientIndex {
-	return []model.ClientIndex{
-		{
-			Columns: []model.ColumnKey{
-				{
-					Column: "name",
-				},
-			},
-		},
-	}
 }
 
 // LoadBalancer protocol constants
@@ -348,7 +309,7 @@ const (
 
 // NBDBModel returns the database model for OVN Northbound database
 func NBDBModel() (model.ClientDBModel, error) {
-	return model.NewClientDBModel("OVN_Northbound", map[string]model.Model{
+	dbModel, err := model.NewClientDBModel("OVN_Northbound", map[string]model.Model{
 		LogicalSwitchTable:     &LogicalSwitch{},
 		LogicalSwitchPortTable: &LogicalSwitchPort{},
 		LogicalRouterTable:     &LogicalRouter{},
@@ -359,14 +320,42 @@ func NBDBModel() (model.ClientDBModel, error) {
 		PortGroupTable:         &PortGroup{},
 		NBGlobalTable:          &NBGlobal{},
 	})
+	if err != nil {
+		return model.ClientDBModel{}, err
+	}
+
+	// Register client indexes for Where() clause lookups
+	// This is required by libovsdb v0.7.0 for model-based queries
+	dbModel.SetIndexes(map[string][]model.ClientIndex{
+		LogicalSwitchTable:     {{Columns: []model.ColumnKey{{Column: "name"}}}},
+		LogicalSwitchPortTable: {{Columns: []model.ColumnKey{{Column: "name"}}}},
+		LogicalRouterTable:     {{Columns: []model.ColumnKey{{Column: "name"}}}},
+		LogicalRouterPortTable: {{Columns: []model.ColumnKey{{Column: "name"}}}},
+		LoadBalancerTable:      {{Columns: []model.ColumnKey{{Column: "name"}}}},
+		AddressSetTable:        {{Columns: []model.ColumnKey{{Column: "name"}}}},
+		PortGroupTable:         {{Columns: []model.ColumnKey{{Column: "name"}}}},
+	})
+
+	return dbModel, nil
 }
 
 // SBDBModel returns the database model for OVN Southbound database
 func SBDBModel() (model.ClientDBModel, error) {
-	return model.NewClientDBModel("OVN_Southbound", map[string]model.Model{
+	dbModel, err := model.NewClientDBModel("OVN_Southbound", map[string]model.Model{
 		ChassisTable:     &Chassis{},
 		EncapTable:       &Encap{},
 		PortBindingTable: &PortBinding{},
 		SBGlobalTable:    &SBGlobal{},
 	})
+	if err != nil {
+		return model.ClientDBModel{}, err
+	}
+
+	// Register client indexes for Where() clause lookups
+	dbModel.SetIndexes(map[string][]model.ClientIndex{
+		ChassisTable:     {{Columns: []model.ColumnKey{{Column: "name"}}}},
+		PortBindingTable: {{Columns: []model.ColumnKey{{Column: "logical_port"}}}},
+	})
+
+	return dbModel, nil
 }

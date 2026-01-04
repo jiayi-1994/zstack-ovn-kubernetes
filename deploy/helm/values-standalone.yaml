@@ -75,6 +75,12 @@ network:
   clusterCIDR: "10.244.0.0/16"
   serviceCIDR: "10.96.0.0/16"
   nodeSubnetSize: 24
+  # Create default subnet automatically
+  # Set to false if you want to manage subnets manually
+  createDefaultSubnet: true
+
+  # Name of the default subnet
+  defaultSubnetName: "default"
 
 gateway:
   mode: local
