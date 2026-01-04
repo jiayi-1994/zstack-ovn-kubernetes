@@ -297,6 +297,20 @@ func (c *Client) connectWithRetry(ctx context.Context, address, dbName string) (
 			return err
 		}
 
+		// Start monitoring all tables - this is required for libovsdb to:
+		// 1. Fetch the database schema
+		// 2. Initialize the local cache
+		// 3. Enable client indexes for Where() clause lookups
+		monitorCtx, monitorCancel := context.WithTimeout(ctx, c.config.ConnectTimeout)
+		defer monitorCancel()
+
+		if _, err := dbClient.MonitorAll(monitorCtx); err != nil {
+			lastErr = err
+			dbClient.Close()
+			klog.V(4).Infof("Failed to monitor %s at %s: %v, retrying...", dbName, address, err)
+			return err
+		}
+
 		return nil
 	}
 
