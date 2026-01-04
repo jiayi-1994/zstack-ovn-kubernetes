@@ -152,7 +152,7 @@ func TestProperty_NamedUUIDFormat(t *testing.T) {
 				chars[i] = 'a' + byte((n+i)%26)
 			}
 			name := string(chars)
-			
+
 			uuid := BuildNamedUUID(name)
 			// Named UUIDs must start with "named-uuid-" and have content after
 			return len(uuid) > 11 && uuid[:11] == "named-uuid-"
@@ -170,7 +170,7 @@ func TestProperty_NamedUUIDFormat(t *testing.T) {
 				chars[i] = 'a' + byte((n+i)%26)
 			}
 			name := string(chars)
-			
+
 			uuid := BuildNamedUUID(name)
 			return IsNamedUUID(uuid)
 		},
@@ -190,11 +190,23 @@ func TestProperty_NamedUUIDFormat(t *testing.T) {
 		gen.AnyString(),
 	))
 
-	// Property: Named UUID preserves the name suffix
-	properties.Property("named UUID preserves name", prop.ForAll(
+	// Property: Named UUID preserves the sanitized name suffix
+	// BuildNamedUUID sanitizes the name by replacing invalid characters with underscores
+	// Valid characters are: [a-zA-Z0-9_]
+	properties.Property("named UUID preserves sanitized name", prop.ForAll(
 		func(name string) bool {
 			uuid := BuildNamedUUID(name)
-			expectedSuffix := name
+			// Compute expected sanitized name
+			sanitized := make([]byte, 0, len(name))
+			for i := 0; i < len(name); i++ {
+				c := name[i]
+				if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' {
+					sanitized = append(sanitized, c)
+				} else {
+					sanitized = append(sanitized, '_')
+				}
+			}
+			expectedSuffix := string(sanitized)
 			actualSuffix := uuid[11:] // Remove "named-uuid-" prefix
 			return actualSuffix == expectedSuffix
 		},
