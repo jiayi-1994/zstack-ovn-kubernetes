@@ -1,3 +1,5 @@
+//go:build e2e
+
 // Package e2e provides command execution utilities for E2E tests.
 //
 // Feature: zstack-ovn-kubernetes-cni

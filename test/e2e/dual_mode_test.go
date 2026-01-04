@@ -1,3 +1,5 @@
+//go:build e2e
+
 // Package e2e contains dual-mode E2E tests for zstack-ovn-kubernetes CNI.
 // These tests verify that both Standalone and External deployment modes
 // provide consistent network functionality.

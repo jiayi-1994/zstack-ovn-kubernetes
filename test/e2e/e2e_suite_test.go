@@ -1,3 +1,5 @@
+//go:build e2e
+
 // Package e2e contains end-to-end tests for zstack-ovn-kubernetes CNI.
 // These tests verify the complete functionality of the CNI plugin in a real
 // Kubernetes cluster environment using Kind (Kubernetes in Docker).

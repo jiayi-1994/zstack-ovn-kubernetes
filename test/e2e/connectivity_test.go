@@ -1,3 +1,5 @@
+//go:build e2e
+
 // Package e2e contains connectivity E2E tests for zstack-ovn-kubernetes CNI.
 // These tests verify Pod-to-Pod and Pod-to-Service network connectivity.
 //

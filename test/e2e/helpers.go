@@ -1,3 +1,5 @@
+//go:build e2e
+
 // Package e2e provides helper functions for E2E tests.
 package e2e
 

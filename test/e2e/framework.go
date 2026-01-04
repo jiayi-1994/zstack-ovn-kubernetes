@@ -1,3 +1,5 @@
+//go:build e2e
+
 // Package e2e provides the E2E testing framework for zstack-ovn-kubernetes CNI.
 package e2e
 
