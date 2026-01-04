@@ -112,7 +112,6 @@ var _ = Describe("Pod Network Connectivity", func() {
 		})
 	})
 
-
 	Describe("Cross-Node Pod Communication", func() {
 		// Validates: Requirements 21.2
 		// WHEN two Pods are on different nodes, THE Network_Datapath SHALL
@@ -248,7 +247,6 @@ var _ = Describe("Pod Network Connectivity", func() {
 			Expect(success).To(BeTrue(), "TCP connection should succeed between cross-node pods")
 		})
 	})
-
 
 	Describe("Pod to Service Communication", func() {
 		// Validates: Requirements 19.1
@@ -392,7 +390,7 @@ var _ = Describe("Pod Network Connectivity", func() {
 			By("Getting service ClusterIP")
 			clusterIP, err := f.GetServiceClusterIP(ctx, namespace, serviceName)
 			Expect(err).NotTo(HaveOccurred())
-			fmt.Println("1234")
+			fmt.Println("12345")
 			By("Testing multiple connections to verify load balancing")
 			// Make multiple connections to verify the service is accessible
 			for i := 0; i < 5; i++ {
