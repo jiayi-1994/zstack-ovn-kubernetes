@@ -123,7 +123,7 @@ spec:
           image: ghcr.io/jiayi-1994/zstack-ovnkube-node:0.1.0
           imagePullPolicy: IfNotPresent
           command:
-            - /zstack-ovnkube-node
+            - /usr/local/bin/zstack-ovnkube-node
           args:
             - --config=/etc/zstack-ovn/config.yaml
           env:

@@ -89,7 +89,7 @@ spec:
           image: "{{ .Values.controller.image.repository }}:{{ .Values.controller.image.tag }}"
           imagePullPolicy: {{ .Values.controller.image.pullPolicy }}
           command:
-            - /zstack-ovnkube-controller
+            - /usr/local/bin/zstack-ovnkube-controller
           args:
             - --config=/etc/zstack-ovn/config.yaml
             - --leader-elect={{ gt (int .Values.controller.replicas) 1 }}

@@ -79,7 +79,7 @@ spec:
           image: ghcr.io/jiayi-1994/zstack-ovnkube-controller:0.1.0
           imagePullPolicy: IfNotPresent
           command:
-            - /zstack-ovnkube-controller
+            - /usr/local/bin/zstack-ovnkube-controller
           args:
             - --config=/etc/zstack-ovn/config.yaml
             - --leader-elect=false

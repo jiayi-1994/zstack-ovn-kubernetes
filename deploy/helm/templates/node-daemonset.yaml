@@ -48,22 +48,24 @@ spec:
             - -c
             - |
               set -ex
-              # Copy CNI binary
+              # Copy CNI binary (located at /opt/cni/bin/zstack-ovn-cni in the image)
               echo "Installing CNI binary..."
-              cp /zstack-ovn-cni /host/opt/cni/bin/zstack-ovn-cni
+              cp /opt/cni/bin/zstack-ovn-cni /host/opt/cni/bin/zstack-ovn-cni
               chmod +x /host/opt/cni/bin/zstack-ovn-cni
               
-              # Copy CNI configuration
+              # Copy CNI configuration from ConfigMap
               echo "Installing CNI configuration..."
               cp /etc/cni-conf/cni-conf.json /host/etc/cni/net.d/10-zstack-ovn.conflist
               
               echo "CNI installation complete!"
+              ls -la /host/opt/cni/bin/
+              cat /host/etc/cni/net.d/10-zstack-ovn.conflist
           volumeMounts:
             - name: cni-bin
               mountPath: /host/opt/cni/bin
             - name: cni-conf
               mountPath: /host/etc/cni/net.d
-            - name: config
+            - name: cni-config
               mountPath: /etc/cni-conf
               readOnly: true
           securityContext:
@@ -119,7 +121,7 @@ spec:
           image: "{{ .Values.node.image.repository }}:{{ .Values.node.image.tag }}"
           imagePullPolicy: {{ .Values.node.image.pullPolicy }}
           command:
-            - /zstack-ovnkube-node
+            - /usr/local/bin/zstack-ovnkube-node
           args:
             - --config=/etc/zstack-ovn/config.yaml
           env:
@@ -241,6 +243,12 @@ spec:
         - name: config
           configMap:
             name: {{ include "zstack-ovn-kubernetes.fullname" . }}-config
+        - name: cni-config
+          configMap:
+            name: {{ include "zstack-ovn-kubernetes.fullname" . }}-config
+            items:
+              - key: cni-conf.json
+                path: cni-conf.json
         - name: cni-bin
           hostPath:
             path: /opt/cni/bin
