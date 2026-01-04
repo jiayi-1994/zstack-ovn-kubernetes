@@ -177,33 +177,15 @@ func SetupInterface(cfg *InterfaceConfig) (*InterfaceInfo, error) {
 	// Create veth pair and configure interface
 	var containerMAC string
 	err = containerNS.Do(func(hostNS ns.NetNS) error {
-		// Create veth pair
-		// The host end stays in the host namespace, container end is in container namespace
-		hostVeth, containerVeth, err := ip.SetupVeth(cfg.IfName, cfg.MTU, cfg.MACAddress, hostNS)
+		// Create veth pair with specified host interface name
+		// ip.SetupVethWithName creates the veth pair and moves the host end to hostNS
+		hostVeth, containerVeth, err := ip.SetupVethWithName(cfg.IfName, hostIfName, cfg.MTU, cfg.MACAddress, hostNS)
 		if err != nil {
 			return fmt.Errorf("failed to create veth pair: %w", err)
 		}
 
-		// Rename host veth to our generated name
-		hostLink, err := netlink.LinkByName(hostVeth.Name)
-		if err != nil {
-			return fmt.Errorf("failed to find host veth %s: %w", hostVeth.Name, err)
-		}
-
-		// Move to host namespace and rename
-		err = hostNS.Do(func(_ ns.NetNS) error {
-			link, err := netlink.LinkByName(hostVeth.Name)
-			if err != nil {
-				return fmt.Errorf("failed to find host veth in host ns: %w", err)
-			}
-			if err := netlink.LinkSetName(link, hostIfName); err != nil {
-				return fmt.Errorf("failed to rename host veth to %s: %w", hostIfName, err)
-			}
-			return nil
-		})
-		if err != nil {
-			return err
-		}
+		klog.V(4).Infof("Created veth pair: host=%s (mac=%s), container=%s (mac=%s)",
+			hostVeth.Name, hostVeth.HardwareAddr, containerVeth.Name, containerVeth.HardwareAddr)
 
 		// Store container MAC address
 		containerMAC = containerVeth.HardwareAddr.String()
@@ -213,7 +195,6 @@ func SetupInterface(cfg *InterfaceConfig) (*InterfaceInfo, error) {
 			return fmt.Errorf("failed to configure network: %w", err)
 		}
 
-		_ = hostLink // Used above
 		return nil
 	})
 
