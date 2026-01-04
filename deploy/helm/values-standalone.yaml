@@ -88,8 +88,8 @@ controller:
   replicas: 1
   image:
     repository: docker.gh-proxy.com/ghcr.io/jiayi-1994/zstack-ovnkube-controller
-    tag: "0.1.0"
-    pullPolicy: IfNotPresent
+    tag: "main"
+    pullPolicy: Always
   serviceAccount:
     name: ""
     annotations: {}
@@ -105,8 +105,8 @@ controller:
 node:
   image:
     repository: docker.gh-proxy.com/ghcr.io/jiayi-1994/zstack-ovnkube-node
-    tag: "0.1.0"
-    pullPolicy: IfNotPresent
+    tag: "main"
+    pullPolicy: Always
   serviceAccount:
     name: ""
     annotations: {}
@@ -122,8 +122,8 @@ node:
 cni:
   image:
     repository: docker.gh-proxy.com/ghcr.io/jiayi-1994/zstack-ovn-cni
-    tag: "0.1.0"
-    pullPolicy: IfNotPresent
+    tag: "main"
+    pullPolicy: Always
 
 # Logging Configuration
 logging:

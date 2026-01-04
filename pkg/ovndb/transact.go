@@ -98,19 +98,19 @@ func TransactAndCheck(c client.Client, ops []ovsdb.Operation, timeout time.Durat
 // BuildNamedUUID generates a named UUID for insert operations
 //
 // Named UUIDs allow referencing newly inserted rows in the same transaction.
-// The format is "named-uuid-<sanitized_name>" which libovsdb recognizes as a named UUID.
+// The format is "named_uuid_<sanitized_name>" which libovsdb recognizes as a named UUID.
 //
-// OVN uuid-name only accepts alphanumeric characters and underscores.
+// OVN uuid-name only accepts alphanumeric characters and underscores (NO hyphens).
 // This function sanitizes the input name by replacing invalid characters.
 //
 // Parameters:
 //   - name: Base name for the UUID
 //
 // Returns:
-//   - string: Named UUID string (sanitized)
+//   - string: Named UUID string (sanitized, using underscores only)
 func BuildNamedUUID(name string) string {
 	// Sanitize name: replace invalid characters with underscores
-	// OVN uuid-name only accepts [a-zA-Z0-9_]
+	// OVN uuid-name only accepts [a-zA-Z0-9_] - NO hyphens allowed!
 	sanitized := make([]byte, 0, len(name))
 	for i := 0; i < len(name); i++ {
 		c := name[i]
@@ -120,12 +120,12 @@ func BuildNamedUUID(name string) string {
 			sanitized = append(sanitized, '_')
 		}
 	}
-	return fmt.Sprintf("named-uuid-%s", string(sanitized))
+	return fmt.Sprintf("named_uuid_%s", string(sanitized))
 }
 
 // IsNamedUUID checks if a UUID is a named UUID
 func IsNamedUUID(uuid string) bool {
-	return len(uuid) > 11 && uuid[:11] == "named-uuid-"
+	return len(uuid) > 11 && uuid[:11] == "named_uuid_"
 }
 
 // GetUUIDFromResult extracts the UUID from an insert operation result

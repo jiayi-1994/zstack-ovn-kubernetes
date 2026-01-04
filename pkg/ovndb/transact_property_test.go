@@ -154,8 +154,8 @@ func TestProperty_NamedUUIDFormat(t *testing.T) {
 			name := string(chars)
 
 			uuid := BuildNamedUUID(name)
-			// Named UUIDs must start with "named-uuid-" and have content after
-			return len(uuid) > 11 && uuid[:11] == "named-uuid-"
+			// Named UUIDs must start with "named_uuid_" (underscores, not hyphens) and have content after
+			return len(uuid) > 11 && uuid[:11] == "named_uuid_"
 		},
 		gen.IntRange(0, 1000),
 	))
@@ -181,8 +181,8 @@ func TestProperty_NamedUUIDFormat(t *testing.T) {
 	properties.Property("IsNamedUUID rejects regular UUIDs", prop.ForAll(
 		func(uuid string) bool {
 			// Regular UUIDs should not be identified as named UUIDs
-			// unless they happen to start with "named-uuid-" and have content after
-			if len(uuid) > 11 && uuid[:11] == "named-uuid-" {
+			// unless they happen to start with "named_uuid_" and have content after
+			if len(uuid) > 11 && uuid[:11] == "named_uuid_" {
 				return IsNamedUUID(uuid)
 			}
 			return !IsNamedUUID(uuid)
@@ -207,7 +207,7 @@ func TestProperty_NamedUUIDFormat(t *testing.T) {
 				}
 			}
 			expectedSuffix := string(sanitized)
-			actualSuffix := uuid[11:] // Remove "named-uuid-" prefix
+			actualSuffix := uuid[11:] // Remove "named_uuid_" prefix
 			return actualSuffix == expectedSuffix
 		},
 		gen.AnyString(),
@@ -219,8 +219,8 @@ func TestProperty_NamedUUIDFormat(t *testing.T) {
 	properties.Property("empty name produces invalid named UUID", prop.ForAll(
 		func(_ int) bool {
 			uuid := BuildNamedUUID("")
-			// "named-uuid-" has exactly 11 characters, so IsNamedUUID returns false
-			return !IsNamedUUID(uuid) && uuid == "named-uuid-"
+			// "named_uuid_" has exactly 11 characters, so IsNamedUUID returns false
+			return !IsNamedUUID(uuid) && uuid == "named_uuid_"
 		},
 		gen.IntRange(0, 10), // Dummy generator to run multiple times
 	))
