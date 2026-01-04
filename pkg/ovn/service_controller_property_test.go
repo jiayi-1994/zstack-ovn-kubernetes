@@ -14,6 +14,7 @@ package ovn
 import (
 	"fmt"
 	"net"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -47,8 +48,8 @@ func TestProperty_ServiceToLoadBalancerConversion(t *testing.T) {
 			expectedPrefix := fmt.Sprintf("Service_%s/%s_%s", namespace, name, protocol)
 			return lbName == expectedPrefix
 		},
-		gen.AlphaString().SuchThat(func(s string) bool { return len(s) > 0 && len(s) <= 63 }),
-		gen.AlphaString().SuchThat(func(s string) bool { return len(s) > 0 && len(s) <= 63 }),
+		genK8sName(),
+		genK8sName(),
 		gen.OneConstOf("tcp", "udp", "sctp"),
 	))
 
@@ -60,8 +61,8 @@ func TestProperty_ServiceToLoadBalancerConversion(t *testing.T) {
 			// Name should end with _nodeport
 			return strings.HasSuffix(lbName, "_nodeport")
 		},
-		gen.AlphaString().SuchThat(func(s string) bool { return len(s) > 0 && len(s) <= 63 }),
-		gen.AlphaString().SuchThat(func(s string) bool { return len(s) > 0 && len(s) <= 63 }),
+		genK8sName(),
+		genK8sName(),
 		gen.OneConstOf("tcp", "udp", "sctp"),
 	))
 
@@ -306,8 +307,8 @@ func TestProperty_LoadBalancerProtocolMapping(t *testing.T) {
 			// LB name should contain the protocol
 			return strings.Contains(lbName, "_"+protocol)
 		},
-		gen.AlphaString().SuchThat(func(s string) bool { return len(s) > 0 && len(s) <= 63 }),
-		gen.AlphaString().SuchThat(func(s string) bool { return len(s) > 0 && len(s) <= 63 }),
+		genK8sName(),
+		genK8sName(),
 		gen.OneConstOf("tcp", "udp", "sctp"),
 	))
 
@@ -319,6 +320,30 @@ func genIPv4Address() gopter.Gen {
 	return gen.ArrayOfN(4, gen.UInt8()).Map(func(ip [4]byte) string {
 		return fmt.Sprintf("%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3])
 	})
+}
+
+// genK8sName generates a valid Kubernetes resource name (1-63 lowercase alphanumeric chars)
+func genK8sName() gopter.Gen {
+	return gen.IntRange(1, 20).FlatMap(func(length interface{}) gopter.Gen {
+		return gen.SliceOfN(length.(int), gen.Rune()).Map(func(runes []rune) string {
+			// Convert to lowercase alphanumeric
+			result := make([]byte, len(runes))
+			for i, r := range runes {
+				// Map to a-z0-9
+				if r >= 'A' && r <= 'Z' {
+					result[i] = byte(r - 'A' + 'a')
+				} else if r >= 'a' && r <= 'z' {
+					result[i] = byte(r)
+				} else if r >= '0' && r <= '9' {
+					result[i] = byte(r)
+				} else {
+					// Map other chars to a-z
+					result[i] = byte('a' + (byte(r) % 26))
+				}
+			}
+			return string(result)
+		})
+	}, reflect.TypeOf(""))
 }
 
 // genEndpointInfo generates an EndpointInfo for testing
