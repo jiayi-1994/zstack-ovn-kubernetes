@@ -167,9 +167,13 @@ func main() {
 func parseFlags() *Options {
 	opts := &Options{}
 
+	// Initialize klog flags first (this registers kubeconfig flag)
+	klog.InitFlags(nil)
+
 	flag.StringVar(&opts.ConfigFile, "config", "",
 		"Path to configuration file (can also use ZSTACK_OVN_CONFIG_FILE env var)")
-	flag.StringVar(&opts.Kubeconfig, "kubeconfig", "",
+	// Note: kubeconfig is already registered by klog.InitFlags, so we use a different name
+	flag.StringVar(&opts.Kubeconfig, "kube-config", "",
 		"Path to kubeconfig file (default: in-cluster config)")
 	flag.BoolVar(&opts.LeaderElect, "leader-elect", true,
 		"Enable leader election for high availability")
@@ -190,10 +194,12 @@ func parseFlags() *Options {
 	flag.BoolVar(&opts.PrintVersion, "version", false,
 		"Print version information and exit")
 
-	// Initialize klog flags
-	klog.InitFlags(nil)
-
 	flag.Parse()
+
+	// Check if kubeconfig was provided via klog's flag
+	if kubeconfigFlag := flag.Lookup("kubeconfig"); kubeconfigFlag != nil && kubeconfigFlag.Value.String() != "" {
+		opts.Kubeconfig = kubeconfigFlag.Value.String()
+	}
 
 	return opts
 }
