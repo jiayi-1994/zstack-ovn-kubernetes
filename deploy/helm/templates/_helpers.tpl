@@ -160,3 +160,15 @@ OVN standalone image
 {{- define "zstack-ovn-kubernetes.ovnImage" -}}
 {{- printf "%s:%s" .Values.ovn.standalone.image.repository .Values.ovn.standalone.image.tag }}
 {{- end }}
+
+{{/*
+Calculate default gateway from cluster CIDR
+For 10.244.0.0/16, returns 10.244.0.1
+*/}}
+{{- define "zstack-ovn-kubernetes.defaultGateway" -}}
+{{- $cidr := .Values.network.clusterCIDR -}}
+{{- $parts := splitList "/" $cidr -}}
+{{- $ip := index $parts 0 -}}
+{{- $octets := splitList "." $ip -}}
+{{- printf "%s.%s.%s.1" (index $octets 0) (index $octets 1) (index $octets 2) -}}
+{{- end }}

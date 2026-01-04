@@ -56,6 +56,19 @@ type LogicalSwitch struct {
 	Copp              *string           `ovsdb:"copp"`
 }
 
+// Index returns the index for LogicalSwitch (name is the primary index)
+func (ls *LogicalSwitch) Index() []model.ClientIndex {
+	return []model.ClientIndex{
+		{
+			Columns: []model.ColumnKey{
+				{
+					Column: "name",
+				},
+			},
+		},
+	}
+}
+
 // LogicalSwitchPort represents an OVN Logical Switch Port
 // A logical switch port is a virtual network interface attached to a logical switch.
 // In Kubernetes context, each Pod has a logical switch port.
@@ -87,6 +100,19 @@ type LogicalSwitchPort struct {
 	TagRequest       *int              `ovsdb:"tag_request"`
 }
 
+// Index returns the index for LogicalSwitchPort (name is the primary index)
+func (lsp *LogicalSwitchPort) Index() []model.ClientIndex {
+	return []model.ClientIndex{
+		{
+			Columns: []model.ColumnKey{
+				{
+					Column: "name",
+				},
+			},
+		},
+	}
+}
+
 // LogicalRouter represents an OVN Logical Router
 // A logical router provides L3 routing between logical switches.
 // In Kubernetes context, it routes traffic between different subnets and to external networks.
@@ -107,16 +133,16 @@ type LogicalRouter struct {
 // LogicalRouterPort represents an OVN Logical Router Port
 // A logical router port connects a logical router to a logical switch or another router.
 type LogicalRouterPort struct {
-	UUID        string            `ovsdb:"_uuid"`
-	Name        string            `ovsdb:"name"`
-	Networks    []string          `ovsdb:"networks"`
-	MAC         string            `ovsdb:"mac"`
-	Peer        *string           `ovsdb:"peer"`
-	Options     map[string]string `ovsdb:"options"`
-	ExternalIDs map[string]string `ovsdb:"external_ids"`
-	Enabled     *bool             `ovsdb:"enabled"`
-	GatewayChassis []string       `ovsdb:"gateway_chassis"`
-	HaChassisGroup *string        `ovsdb:"ha_chassis_group"`
+	UUID           string            `ovsdb:"_uuid"`
+	Name           string            `ovsdb:"name"`
+	Networks       []string          `ovsdb:"networks"`
+	MAC            string            `ovsdb:"mac"`
+	Peer           *string           `ovsdb:"peer"`
+	Options        map[string]string `ovsdb:"options"`
+	ExternalIDs    map[string]string `ovsdb:"external_ids"`
+	Enabled        *bool             `ovsdb:"enabled"`
+	GatewayChassis []string          `ovsdb:"gateway_chassis"`
+	HaChassisGroup *string           `ovsdb:"ha_chassis_group"`
 }
 
 // LoadBalancer represents an OVN Load Balancer
@@ -138,6 +164,19 @@ type LoadBalancer struct {
 	HealthCheck     []string          `ovsdb:"health_check"`
 	IPPortMappings  map[string]string `ovsdb:"ip_port_mappings"`
 	SelectionFields []string          `ovsdb:"selection_fields"`
+}
+
+// Index returns the index for LoadBalancer (name is the primary index)
+func (lb *LoadBalancer) Index() []model.ClientIndex {
+	return []model.ClientIndex{
+		{
+			Columns: []model.ColumnKey{
+				{
+					Column: "name",
+				},
+			},
+		},
+	}
 }
 
 // LoadBalancer protocol constants
@@ -226,15 +265,15 @@ type NBGlobal struct {
 // Chassis represents an OVN Chassis (physical node)
 // Each Kubernetes node running ovn-controller registers as a chassis.
 type Chassis struct {
-	UUID            string            `ovsdb:"_uuid"`
-	Name            string            `ovsdb:"name"`
-	Hostname        string            `ovsdb:"hostname"`
-	Encaps          []string          `ovsdb:"encaps"`
-	VtepLogicalSwitches []string      `ovsdb:"vtep_logical_switches"`
-	ExternalIDs     map[string]string `ovsdb:"external_ids"`
-	NbCfg           int               `ovsdb:"nb_cfg"`
-	TransportZones  []string          `ovsdb:"transport_zones"`
-	OtherConfig     map[string]string `ovsdb:"other_config"`
+	UUID                string            `ovsdb:"_uuid"`
+	Name                string            `ovsdb:"name"`
+	Hostname            string            `ovsdb:"hostname"`
+	Encaps              []string          `ovsdb:"encaps"`
+	VtepLogicalSwitches []string          `ovsdb:"vtep_logical_switches"`
+	ExternalIDs         map[string]string `ovsdb:"external_ids"`
+	NbCfg               int               `ovsdb:"nb_cfg"`
+	TransportZones      []string          `ovsdb:"transport_zones"`
+	OtherConfig         map[string]string `ovsdb:"other_config"`
 }
 
 // Encap represents tunnel encapsulation configuration
@@ -255,24 +294,24 @@ const (
 
 // PortBinding represents logical port to chassis binding
 type PortBinding struct {
-	UUID           string            `ovsdb:"_uuid"`
-	LogicalPort    string            `ovsdb:"logical_port"`
-	Chassis        *string           `ovsdb:"chassis"`
-	Encap          *string           `ovsdb:"encap"`
-	Type           string            `ovsdb:"type"`
-	Options        map[string]string `ovsdb:"options"`
-	MAC            []string          `ovsdb:"mac"`
-	NatAddresses   []string          `ovsdb:"nat_addresses"`
-	ExternalIDs    map[string]string `ovsdb:"external_ids"`
-	Datapath       string            `ovsdb:"datapath"`
-	TunnelKey      int               `ovsdb:"tunnel_key"`
-	ParentPort     *string           `ovsdb:"parent_port"`
-	Tag            *int              `ovsdb:"tag"`
-	Up             *bool             `ovsdb:"up"`
-	GatewayChassis []string          `ovsdb:"gateway_chassis"`
-	HaChassisGroup *string           `ovsdb:"ha_chassis_group"`
-	VirtualParent  *string           `ovsdb:"virtual_parent"`
-	RequestedChassis *string         `ovsdb:"requested_chassis"`
+	UUID             string            `ovsdb:"_uuid"`
+	LogicalPort      string            `ovsdb:"logical_port"`
+	Chassis          *string           `ovsdb:"chassis"`
+	Encap            *string           `ovsdb:"encap"`
+	Type             string            `ovsdb:"type"`
+	Options          map[string]string `ovsdb:"options"`
+	MAC              []string          `ovsdb:"mac"`
+	NatAddresses     []string          `ovsdb:"nat_addresses"`
+	ExternalIDs      map[string]string `ovsdb:"external_ids"`
+	Datapath         string            `ovsdb:"datapath"`
+	TunnelKey        int               `ovsdb:"tunnel_key"`
+	ParentPort       *string           `ovsdb:"parent_port"`
+	Tag              *int              `ovsdb:"tag"`
+	Up               *bool             `ovsdb:"up"`
+	GatewayChassis   []string          `ovsdb:"gateway_chassis"`
+	HaChassisGroup   *string           `ovsdb:"ha_chassis_group"`
+	VirtualParent    *string           `ovsdb:"virtual_parent"`
+	RequestedChassis *string           `ovsdb:"requested_chassis"`
 }
 
 // SBGlobal represents the SB_Global table

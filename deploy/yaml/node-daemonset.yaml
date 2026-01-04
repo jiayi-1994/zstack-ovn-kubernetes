@@ -158,10 +158,10 @@ spec:
               value: "tcp:ovn-sb-db.zstack-ovn-kubernetes.svc.cluster.local:6642"
           ports:
             - name: metrics
-              containerPort: 9091
+              containerPort: 8082
               protocol: TCP
             - name: health
-              containerPort: 8082
+              containerPort: 8083
               protocol: TCP
           livenessProbe:
             httpGet:

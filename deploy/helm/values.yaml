@@ -94,6 +94,13 @@ network:
   # Subnet size for each node (e.g., 24 means /24 subnet per node)
   nodeSubnetSize: 24
 
+  # Create default subnet automatically
+  # Set to false if you want to manage subnets manually
+  createDefaultSubnet: true
+
+  # Name of the default subnet
+  defaultSubnetName: "default"
+
 # Gateway Configuration
 gateway:
   # Gateway mode: "shared" or "local"

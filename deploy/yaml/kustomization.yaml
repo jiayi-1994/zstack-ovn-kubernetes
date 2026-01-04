@@ -17,6 +17,7 @@ namespace: zstack-ovn-kubernetes
 resources:
   - namespace.yaml
   - subnet-crd.yaml
+  - default-subnet.yaml     # Default subnet for Pod networking
   - configmap.yaml
   - rbac.yaml
   - ovn-databases.yaml      # Remove this line for external mode

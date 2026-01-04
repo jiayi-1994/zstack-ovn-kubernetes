@@ -73,6 +73,15 @@ spec:
                     - IPv6
                     - Dual
                   default: IPv4
+                default:
+                  type: boolean
+                  description: 'Default indicates whether this is the default subnet for the cluster'
+                  default: false
+                namespaces:
+                  type: array
+                  description: 'Namespaces is a list of namespaces that can use this subnet'
+                  items:
+                    type: string
             status:
               type: object
               description: SubnetStatus defines the observed state of Subnet

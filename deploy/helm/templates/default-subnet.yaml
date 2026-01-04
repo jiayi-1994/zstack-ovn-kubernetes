@@ -1,0 +1,25 @@
+# Default Subnet for Pod networking
+# This creates a default subnet using the cluster CIDR from values.yaml
+{{- if .Values.network.createDefaultSubnet | default true }}
+---
+apiVersion: network.zstack.io/v1
+kind: Subnet
+metadata:
+  name: {{ .Values.network.defaultSubnetName | default "default" }}
+  labels:
+    {{- include "zstack-ovn-kubernetes.labels" . | nindent 4 }}
+    network-type: overlay
+spec:
+  # Pod network CIDR from values.yaml
+  cidr: {{ .Values.network.clusterCIDR | quote }}
+  
+  # Gateway is the first usable IP in the CIDR
+  gateway: {{ include "zstack-ovn-kubernetes.defaultGateway" . | quote }}
+  
+  # Exclude gateway IP from allocation
+  excludeIPs:
+    - {{ include "zstack-ovn-kubernetes.defaultGateway" . | quote }}
+  
+  # IP protocol version
+  protocol: IPv4
+{{- end }}

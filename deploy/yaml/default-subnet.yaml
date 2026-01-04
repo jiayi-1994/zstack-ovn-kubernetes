@@ -1,0 +1,29 @@
+# Default Subnet for Pod networking
+# This creates a default subnet for Pod IP allocation
+#
+# Apply after the CRD is created:
+#   kubectl apply -f default-subnet.yaml
+#
+# Verify:
+#   kubectl get subnet default -o wide
+---
+apiVersion: network.zstack.io/v1
+kind: Subnet
+metadata:
+  name: default
+  labels:
+    app.kubernetes.io/name: zstack-ovn-kubernetes
+    network-type: overlay
+spec:
+  # Pod network CIDR - should match your cluster configuration
+  cidr: "10.244.0.0/16"
+  
+  # Gateway is the first usable IP in the CIDR
+  gateway: "10.244.0.1"
+  
+  # Exclude gateway IP from allocation
+  excludeIPs:
+    - "10.244.0.1"
+  
+  # IP protocol version
+  protocol: IPv4

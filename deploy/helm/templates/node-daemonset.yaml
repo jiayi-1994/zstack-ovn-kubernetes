@@ -146,10 +146,10 @@ spec:
               value: {{ include "zstack-ovn-kubernetes.sbdbAddressForNode" . | quote }}
           ports:
             - name: metrics
-              containerPort: 9091
+              containerPort: 8082
               protocol: TCP
             - name: health
-              containerPort: 8082
+              containerPort: 8083
               protocol: TCP
           livenessProbe:
             httpGet:
