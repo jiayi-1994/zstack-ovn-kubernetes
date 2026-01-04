@@ -64,8 +64,9 @@ const (
 // Responsibilities:
 // - Allocate per-node subnets from cluster CIDR
 // - Create node-level Logical Switches in OVN
+// - Create Cluster Router and Router Ports for L3 connectivity
 // - Configure tunnel endpoints for cross-node communication
-// - Manage gateway configuration
+// - Manage gateway configuration and NAT rules
 //
 // The controller watches Node resources and reconciles their network state.
 type NodeController struct {
@@ -81,6 +82,9 @@ type NodeController struct {
 	// ovnClient is the OVN database client
 	ovnClient *ovndb.Client
 
+	// lrOps provides Logical Router operations
+	lrOps *ovndb.LogicalRouterOps
+
 	// clusterSubnetAllocator allocates per-node subnets from cluster CIDR
 	clusterSubnetAllocator *ClusterSubnetAllocator
 
@@ -93,6 +97,9 @@ type NodeController struct {
 	// nodeSubnets tracks allocated subnets per node
 	// Key: node name, Value: allocated subnet CIDR
 	nodeSubnets map[string]string
+
+	// clusterRouterInitialized tracks if cluster router has been created
+	clusterRouterInitialized bool
 }
 
 // ClusterSubnetAllocator manages allocation of per-node subnets from the cluster CIDR.
@@ -321,11 +328,17 @@ func NewNodeController(
 		return nil, fmt.Errorf("failed to create cluster subnet allocator: %w", err)
 	}
 
+	var lrOps *ovndb.LogicalRouterOps
+	if ovnClient != nil {
+		lrOps = ovndb.NewLogicalRouterOps(ovnClient)
+	}
+
 	return &NodeController{
 		client:                 client,
 		kubeClient:             kubeClient,
 		config:                 cfg,
 		ovnClient:              ovnClient,
+		lrOps:                  lrOps,
 		clusterSubnetAllocator: clusterAllocator,
 		recorder:               recorder,
 		nodeSubnets:            make(map[string]string),
@@ -429,12 +442,21 @@ func (c *NodeController) handleNodeDelete(ctx context.Context, nodeName string) 
 // handleNodeCreateOrUpdate handles node creation or update.
 //
 // Steps:
-// 1. Check if node already has a subnet annotation
-// 2. If not, allocate a new subnet
-// 3. Create or update the node's Logical Switch in OVN
-// 4. Update node annotations
+// 1. Ensure cluster router exists
+// 2. Check if node already has a subnet annotation
+// 3. If not, allocate a new subnet
+// 4. Create or update the node's Logical Switch in OVN
+// 5. Create Router Port connecting switch to cluster router
+// 6. Configure SNAT for external access
+// 7. Update node annotations
 func (c *NodeController) handleNodeCreateOrUpdate(ctx context.Context, node *corev1.Node) (ctrl.Result, error) {
 	klog.V(4).Infof("Handling create/update of Node %s", node.Name)
+
+	// Ensure cluster router exists (only once)
+	if err := c.ensureClusterRouter(ctx); err != nil {
+		klog.Errorf("Failed to ensure cluster router: %v", err)
+		return ctrl.Result{}, err
+	}
 
 	// Check if node already has a subnet
 	existingSubnet := node.Annotations[NodeSubnetAnnotation]
@@ -482,6 +504,21 @@ func (c *NodeController) handleNodeCreateOrUpdate(ctx context.Context, node *cor
 		c.recorder.Eventf(node, corev1.EventTypeWarning, "LogicalSwitchFailed",
 			"Failed to create/update Logical Switch: %v", err)
 		return ctrl.Result{}, err
+	}
+
+	// Create Router Port connecting switch to cluster router
+	if err := c.ensureRouterPort(ctx, node, subnet, gatewayIP); err != nil {
+		klog.Errorf("Failed to ensure Router Port for node %s: %v", node.Name, err)
+		c.recorder.Eventf(node, corev1.EventTypeWarning, "RouterPortFailed",
+			"Failed to create/update Router Port: %v", err)
+		return ctrl.Result{}, err
+	}
+
+	// Configure SNAT for external access
+	if err := c.ensureSNAT(ctx, node, subnet); err != nil {
+		klog.Errorf("Failed to ensure SNAT for node %s: %v", node.Name, err)
+		// Don't fail the reconciliation for SNAT errors
+		klog.Warningf("SNAT configuration failed, external access may not work: %v", err)
 	}
 
 	// Update node annotations
@@ -656,4 +693,165 @@ func (c *NodeController) SyncExistingNodes(ctx context.Context) error {
 
 	klog.Infof("Synced %d existing nodes", len(nodeList.Items))
 	return nil
+}
+
+// ensureClusterRouter ensures the cluster-wide logical router exists.
+// This is called once during the first node reconciliation.
+func (c *NodeController) ensureClusterRouter(ctx context.Context) error {
+	c.mu.Lock()
+	if c.clusterRouterInitialized {
+		c.mu.Unlock()
+		return nil
+	}
+	c.mu.Unlock()
+
+	if c.ovnClient == nil || !c.ovnClient.IsConnected() {
+		klog.V(4).Info("OVN client not connected, skipping cluster router creation")
+		return nil
+	}
+
+	if c.lrOps == nil {
+		c.lrOps = ovndb.NewLogicalRouterOps(c.ovnClient)
+	}
+
+	_, err := c.lrOps.CreateClusterRouter(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to create cluster router: %w", err)
+	}
+
+	c.mu.Lock()
+	c.clusterRouterInitialized = true
+	c.mu.Unlock()
+
+	klog.Info("Cluster router initialized")
+	return nil
+}
+
+// ensureRouterPort creates or updates the router port connecting a node's switch to the cluster router.
+func (c *NodeController) ensureRouterPort(ctx context.Context, node *corev1.Node, subnet *net.IPNet, gatewayIP net.IP) error {
+	if c.ovnClient == nil || !c.ovnClient.IsConnected() {
+		klog.V(4).Infof("OVN client not connected, skipping router port creation for node %s", node.Name)
+		return nil
+	}
+
+	if c.lrOps == nil {
+		return fmt.Errorf("logical router ops not initialized")
+	}
+
+	switchName := c.getNodeLogicalSwitchName(node.Name)
+
+	// Generate MAC address for router port based on gateway IP
+	// Format: 0a:58:xx:xx:xx:xx where xx:xx:xx:xx is the gateway IP
+	mac := c.generateRouterPortMAC(gatewayIP)
+
+	// Network in CIDR format: gatewayIP/prefixLen
+	ones, _ := subnet.Mask.Size()
+	network := fmt.Sprintf("%s/%d", gatewayIP.String(), ones)
+
+	klog.V(4).Infof("Ensuring router port for node %s: switch=%s, network=%s, mac=%s",
+		node.Name, switchName, network, mac)
+
+	if err := c.lrOps.EnsureRouterPortToSwitch(ctx, switchName, gatewayIP.String(), subnet.String(), mac); err != nil {
+		return fmt.Errorf("failed to ensure router port: %w", err)
+	}
+
+	klog.Infof("Ensured router port for node %s connecting to cluster router", node.Name)
+	return nil
+}
+
+// ensureSNAT configures SNAT rules for a node's subnet to enable external access.
+func (c *NodeController) ensureSNAT(ctx context.Context, node *corev1.Node, subnet *net.IPNet) error {
+	if c.ovnClient == nil || !c.ovnClient.IsConnected() {
+		klog.V(4).Infof("OVN client not connected, skipping SNAT configuration for node %s", node.Name)
+		return nil
+	}
+
+	if c.lrOps == nil {
+		return fmt.Errorf("logical router ops not initialized")
+	}
+
+	// Get node's internal IP for SNAT
+	nodeIP := c.getNodeInternalIP(node)
+	if nodeIP == "" {
+		klog.Warningf("No internal IP found for node %s, skipping SNAT", node.Name)
+		return nil
+	}
+
+	// Add SNAT rule: subnet -> nodeIP
+	// This allows pods to access external networks using the node's IP
+	if err := c.lrOps.AddNAT(ctx, ovndb.NATTypeSNAT, nodeIP, subnet.String()); err != nil {
+		// Ignore duplicate errors
+		if !isDuplicateError(err) {
+			return fmt.Errorf("failed to add SNAT rule: %w", err)
+		}
+		klog.V(4).Infof("SNAT rule already exists for subnet %s", subnet.String())
+	} else {
+		klog.Infof("Added SNAT rule for node %s: %s -> %s", node.Name, subnet.String(), nodeIP)
+	}
+
+	return nil
+}
+
+// generateRouterPortMAC generates a MAC address for a router port based on the gateway IP.
+// Format: 0a:58:xx:xx:xx:xx where xx:xx:xx:xx is derived from the IP
+func (c *NodeController) generateRouterPortMAC(ip net.IP) string {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		// For IPv6, use a different scheme
+		return fmt.Sprintf("0a:58:00:00:00:01")
+	}
+	return fmt.Sprintf("0a:58:%02x:%02x:%02x:%02x", ip4[0], ip4[1], ip4[2], ip4[3])
+}
+
+// getNodeInternalIP returns the internal IP address of a node.
+func (c *NodeController) getNodeInternalIP(node *corev1.Node) string {
+	for _, addr := range node.Status.Addresses {
+		if addr.Type == corev1.NodeInternalIP {
+			return addr.Address
+		}
+	}
+	return ""
+}
+
+// isDuplicateError checks if an error indicates a duplicate entry.
+func isDuplicateError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return contains(errStr, "duplicate") || contains(errStr, "already exists") || contains(errStr, "constraint violation")
+}
+
+// contains checks if a string contains a substring (case-insensitive).
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(substr) == 0 ||
+		(len(s) > 0 && len(substr) > 0 && containsLower(s, substr)))
+}
+
+func containsLower(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if matchLower(s[i:i+len(substr)], substr) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchLower(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		ca, cb := a[i], b[i]
+		if ca >= 'A' && ca <= 'Z' {
+			ca += 'a' - 'A'
+		}
+		if cb >= 'A' && cb <= 'Z' {
+			cb += 'a' - 'A'
+		}
+		if ca != cb {
+			return false
+		}
+	}
+	return true
 }

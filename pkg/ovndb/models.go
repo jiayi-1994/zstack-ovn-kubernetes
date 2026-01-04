@@ -91,17 +91,18 @@ type LogicalSwitchPort struct {
 // A logical router provides L3 routing between logical switches.
 // In Kubernetes context, it routes traffic between different subnets and to external networks.
 type LogicalRouter struct {
-	UUID         string            `ovsdb:"_uuid"`
-	Name         string            `ovsdb:"name"`
-	Ports        []string          `ovsdb:"ports"`
-	StaticRoutes []string          `ovsdb:"static_routes"`
-	Policies     []string          `ovsdb:"policies"`
-	Nat          []string          `ovsdb:"nat"`
-	LoadBalancer []string          `ovsdb:"load_balancer"`
-	Options      map[string]string `ovsdb:"options"`
-	ExternalIDs  map[string]string `ovsdb:"external_ids"`
-	Enabled      *bool             `ovsdb:"enabled"`
-	Copp         *string           `ovsdb:"copp"`
+	UUID              string            `ovsdb:"_uuid"`
+	Name              string            `ovsdb:"name"`
+	Ports             []string          `ovsdb:"ports"`
+	StaticRoutes      []string          `ovsdb:"static_routes"`
+	Policies          []string          `ovsdb:"policies"`
+	NAT               []string          `ovsdb:"nat"`
+	LoadBalancer      []string          `ovsdb:"load_balancer"`
+	LoadBalancerGroup []string          `ovsdb:"load_balancer_group"`
+	Options           map[string]string `ovsdb:"options"`
+	ExternalIDs       map[string]string `ovsdb:"external_ids"`
+	Enabled           *bool             `ovsdb:"enabled"`
+	Copp              *string           `ovsdb:"copp"`
 }
 
 // LogicalRouterPort represents an OVN Logical Router Port
@@ -118,6 +119,42 @@ type LogicalRouterPort struct {
 	GatewayChassis []string          `ovsdb:"gateway_chassis"`
 	HaChassisGroup *string           `ovsdb:"ha_chassis_group"`
 }
+
+// LogicalRouterStaticRoute represents a static route on a logical router
+type LogicalRouterStaticRoute struct {
+	UUID        string            `ovsdb:"_uuid"`
+	IPPrefix    string            `ovsdb:"ip_prefix"`
+	Nexthop     string            `ovsdb:"nexthop"`
+	OutputPort  *string           `ovsdb:"output_port"`
+	Policy      *string           `ovsdb:"policy"`
+	Options     map[string]string `ovsdb:"options"`
+	ExternalIDs map[string]string `ovsdb:"external_ids"`
+	BFD         *string           `ovsdb:"bfd"`
+	RouteTable  string            `ovsdb:"route_table"`
+}
+
+// NAT represents a NAT rule on a logical router
+type NAT struct {
+	UUID              string            `ovsdb:"_uuid"`
+	Type              string            `ovsdb:"type"`
+	ExternalIP        string            `ovsdb:"external_ip"`
+	ExternalMAC       *string           `ovsdb:"external_mac"`
+	ExternalPortRange string            `ovsdb:"external_port_range"`
+	LogicalIP         string            `ovsdb:"logical_ip"`
+	LogicalPort       *string           `ovsdb:"logical_port"`
+	Options           map[string]string `ovsdb:"options"`
+	ExternalIDs       map[string]string `ovsdb:"external_ids"`
+	AllowedExtIPs     *string           `ovsdb:"allowed_ext_ips"`
+	ExemptedExtIPs    *string           `ovsdb:"exempted_ext_ips"`
+	GatewayPort       *string           `ovsdb:"gateway_port"`
+}
+
+// NAT type constants
+const (
+	NATTypeSNAT        = "snat"
+	NATTypeDNAT        = "dnat"
+	NATTypeDNATAndSNAT = "dnat_and_snat"
+)
 
 // LoadBalancer represents an OVN Load Balancer
 // A load balancer implements L4 load balancing for Kubernetes Services.
@@ -292,33 +329,37 @@ type SBGlobal struct {
 
 // Table name constants
 const (
-	LogicalSwitchTable     = "Logical_Switch"
-	LogicalSwitchPortTable = "Logical_Switch_Port"
-	LogicalRouterTable     = "Logical_Router"
-	LogicalRouterPortTable = "Logical_Router_Port"
-	LoadBalancerTable      = "Load_Balancer"
-	ACLTable               = "ACL"
-	AddressSetTable        = "Address_Set"
-	PortGroupTable         = "Port_Group"
-	NBGlobalTable          = "NB_Global"
-	ChassisTable           = "Chassis"
-	EncapTable             = "Encap"
-	PortBindingTable       = "Port_Binding"
-	SBGlobalTable          = "SB_Global"
+	LogicalSwitchTable            = "Logical_Switch"
+	LogicalSwitchPortTable        = "Logical_Switch_Port"
+	LogicalRouterTable            = "Logical_Router"
+	LogicalRouterPortTable        = "Logical_Router_Port"
+	LogicalRouterStaticRouteTable = "Logical_Router_Static_Route"
+	NATTable                      = "NAT"
+	LoadBalancerTable             = "Load_Balancer"
+	ACLTable                      = "ACL"
+	AddressSetTable               = "Address_Set"
+	PortGroupTable                = "Port_Group"
+	NBGlobalTable                 = "NB_Global"
+	ChassisTable                  = "Chassis"
+	EncapTable                    = "Encap"
+	PortBindingTable              = "Port_Binding"
+	SBGlobalTable                 = "SB_Global"
 )
 
 // NBDBModel returns the database model for OVN Northbound database
 func NBDBModel() (model.ClientDBModel, error) {
 	dbModel, err := model.NewClientDBModel("OVN_Northbound", map[string]model.Model{
-		LogicalSwitchTable:     &LogicalSwitch{},
-		LogicalSwitchPortTable: &LogicalSwitchPort{},
-		LogicalRouterTable:     &LogicalRouter{},
-		LogicalRouterPortTable: &LogicalRouterPort{},
-		LoadBalancerTable:      &LoadBalancer{},
-		ACLTable:               &ACL{},
-		AddressSetTable:        &AddressSet{},
-		PortGroupTable:         &PortGroup{},
-		NBGlobalTable:          &NBGlobal{},
+		LogicalSwitchTable:            &LogicalSwitch{},
+		LogicalSwitchPortTable:        &LogicalSwitchPort{},
+		LogicalRouterTable:            &LogicalRouter{},
+		LogicalRouterPortTable:        &LogicalRouterPort{},
+		LogicalRouterStaticRouteTable: &LogicalRouterStaticRoute{},
+		NATTable:                      &NAT{},
+		LoadBalancerTable:             &LoadBalancer{},
+		ACLTable:                      &ACL{},
+		AddressSetTable:               &AddressSet{},
+		PortGroupTable:                &PortGroup{},
+		NBGlobalTable:                 &NBGlobal{},
 	})
 	if err != nil {
 		return model.ClientDBModel{}, err
