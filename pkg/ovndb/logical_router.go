@@ -896,7 +896,10 @@ func (o *LogicalRouterOps) EnsureJoinRouterPort(ctx context.Context, joinSwitch 
 }
 
 // EnsureGatewayChassisPort creates a gateway chassis port on the join switch for a node.
-// This port is bound to the node's chassis and provides the external gateway functionality.
+// This port enables external traffic routing through the node.
+//
+// For distributed gateway mode, we use a "router" type port that connects to
+// a logical router port, enabling proper L3 routing to external networks.
 //
 // Parameters:
 //   - ctx: Context
@@ -924,41 +927,24 @@ func (o *LogicalRouterOps) EnsureGatewayChassisPort(
 	err := nbClient.Get(ctx, existingLSP)
 	if err == nil {
 		klog.V(4).Infof("Gateway chassis port %s already exists", lspName)
-		// Update chassis binding if needed
-		if existingLSP.Options == nil || existingLSP.Options[OptionRequestedChassis] != chassisName {
-			existingLSP.Options = map[string]string{
-				OptionRequestedChassis: chassisName,
-			}
-			updateOps, err := nbClient.Where(existingLSP).Update(existingLSP, &existingLSP.Options)
-			if err != nil {
-				return fmt.Errorf("failed to update gateway port options: %w", err)
-			}
-			results, err := nbClient.Transact(ctx, updateOps...)
-			if err != nil {
-				return fmt.Errorf("failed to update gateway port: %w", err)
-			}
-			if err := checkTransactResults(results); err != nil {
-				return fmt.Errorf("gateway port update failed: %w", err)
-			}
-		}
 		return nil
 	}
 	if err != client.ErrNotFound {
 		return fmt.Errorf("failed to check gateway port: %w", err)
 	}
 
-	// Create gateway chassis port
+	// Create gateway port on join switch
+	// Use empty type (default) with static addresses for gateway functionality
+	// This allows the port to participate in L3 routing
 	lsp := &LogicalSwitchPort{
 		Name:      lspName,
-		Type:      "localport", // localport type for gateway chassis
+		Type:      "", // Default type for regular L2/L3 port
 		Addresses: []string{fmt.Sprintf("%s %s", mac, gatewayIP)},
-		Options: map[string]string{
-			OptionRequestedChassis: chassisName,
-		},
 		ExternalIDs: map[string]string{
-			"k8s.ovn.org/kind":    "gateway-chassis-port",
+			"k8s.ovn.org/kind":    "gateway-port",
 			"k8s.ovn.org/node":    nodeName,
 			"k8s.ovn.org/node-ip": nodeIP,
+			"k8s.ovn.org/chassis": chassisName,
 		},
 	}
 
@@ -1009,7 +995,7 @@ func (o *LogicalRouterOps) EnsureGatewayChassisPort(
 		return fmt.Errorf("gateway chassis port creation failed: %w", err)
 	}
 
-	klog.Infof("Created gateway chassis port %s for node %s", lspName, nodeName)
+	klog.Infof("Created gateway port %s for node %s with IP %s", lspName, nodeName, gatewayIP)
 	return nil
 }
 
@@ -1199,4 +1185,380 @@ func generateMACFromIP(ipStr string) string {
 		return "0a:58:00:00:00:01"
 	}
 	return fmt.Sprintf("0a:58:%02x:%02x:%02x:%02x", ip4[0], ip4[1], ip4[2], ip4[3])
+}
+
+
+// ============================================================================
+// External Network Connectivity
+// ============================================================================
+
+// ExternalSwitchName returns the external switch name for a node
+func GetExternalSwitchName(nodeName string) string {
+	return ExternalSwitchName + nodeName
+}
+
+// LocalnetPortName returns the localnet port name for a node
+func GetLocalnetPortName(nodeName string) string {
+	return "ln-" + nodeName
+}
+
+// EnsureExternalSwitch creates an external switch for connecting to the physical network.
+// This switch has a localnet port that bridges OVN to the physical network.
+//
+// Parameters:
+//   - ctx: Context
+//   - nodeName: Name of the node
+//   - physicalNetwork: Name of the physical network (provider network)
+//   - vlanID: Optional VLAN ID for tagged traffic (0 for untagged)
+func (o *LogicalRouterOps) EnsureExternalSwitch(
+	ctx context.Context,
+	nodeName string,
+	physicalNetwork string,
+	vlanID int,
+) (*LogicalSwitch, error) {
+	nbClient := o.client.NBClient()
+	if nbClient == nil {
+		return nil, fmt.Errorf("NB client is not connected")
+	}
+
+	extSwitchName := GetExternalSwitchName(nodeName)
+	localnetPortName := GetLocalnetPortName(nodeName)
+
+	// Check if external switch already exists
+	ls := &LogicalSwitch{Name: extSwitchName}
+	err := nbClient.Get(ctx, ls)
+	if err == nil {
+		klog.V(4).Infof("External switch %s already exists", extSwitchName)
+		return ls, nil
+	}
+	if err != client.ErrNotFound {
+		return nil, fmt.Errorf("failed to check external switch: %w", err)
+	}
+
+	// Create external switch
+	ls = &LogicalSwitch{
+		UUID: BuildNamedUUID(extSwitchName),
+		Name: extSwitchName,
+		ExternalIDs: map[string]string{
+			"k8s.ovn.org/kind": "external-switch",
+			"k8s.ovn.org/node": nodeName,
+		},
+	}
+
+	var ops []ovsdb.Operation
+
+	createSwitchOps, err := nbClient.Create(ls)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create external switch operation: %w", err)
+	}
+	ops = append(ops, createSwitchOps...)
+
+	// Create localnet port to connect to physical network
+	localnetPort := &LogicalSwitchPort{
+		UUID: BuildNamedUUID(localnetPortName),
+		Name: localnetPortName,
+		Type: "localnet",
+		Options: map[string]string{
+			"network_name": physicalNetwork,
+		},
+		Addresses: []string{"unknown"},
+		ExternalIDs: map[string]string{
+			"k8s.ovn.org/kind": "localnet-port",
+			"k8s.ovn.org/node": nodeName,
+		},
+	}
+
+	// Set VLAN tag if specified
+	if vlanID > 0 {
+		localnetPort.TagRequest = &vlanID
+	}
+
+	createPortOps, err := nbClient.Create(localnetPort)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create localnet port operation: %w", err)
+	}
+	ops = append(ops, createPortOps...)
+
+	// Add localnet port to external switch
+	mutateSwitchOps, err := nbClient.Where(&LogicalSwitch{UUID: ls.UUID}).Mutate(ls, model.Mutation{
+		Field:   &ls.Ports,
+		Mutator: ovsdb.MutateOperationInsert,
+		Value:   []string{localnetPort.UUID},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create switch mutation: %w", err)
+	}
+	ops = append(ops, mutateSwitchOps...)
+
+	// Execute transaction
+	results, err := nbClient.Transact(ctx, ops...)
+	if err != nil {
+		if isDuplicateError(err) {
+			klog.V(4).Infof("External switch %s was created by another reconcile", extSwitchName)
+			existing := &LogicalSwitch{Name: extSwitchName}
+			if getErr := nbClient.Get(ctx, existing); getErr == nil {
+				return existing, nil
+			}
+			return ls, nil
+		}
+		return nil, fmt.Errorf("failed to create external switch: %w", err)
+	}
+
+	if err := checkTransactResults(results); err != nil {
+		if isDuplicateError(err) {
+			klog.V(4).Infof("External switch %s already exists (constraint violation)", extSwitchName)
+			existing := &LogicalSwitch{Name: extSwitchName}
+			if getErr := nbClient.Get(ctx, existing); getErr == nil {
+				return existing, nil
+			}
+			return ls, nil
+		}
+		return nil, fmt.Errorf("external switch creation failed: %w", err)
+	}
+
+	if len(results) > 0 && results[0].UUID.GoUUID != "" {
+		ls.UUID = results[0].UUID.GoUUID
+	}
+
+	klog.Infof("Created external switch %s with localnet port %s for physical network %s",
+		extSwitchName, localnetPortName, physicalNetwork)
+	return ls, nil
+}
+
+// EnsureGatewayRouterToExternal creates the connection between cluster router and external switch.
+// This enables traffic to flow from the cluster router to the physical network.
+//
+// Parameters:
+//   - ctx: Context
+//   - nodeName: Name of the node
+//   - gatewayIP: Gateway IP on the external network (node's physical IP)
+//   - gatewayMAC: MAC address for the gateway port
+//   - nextHop: Next hop IP for default route (external gateway)
+func (o *LogicalRouterOps) EnsureGatewayRouterToExternal(
+	ctx context.Context,
+	nodeName string,
+	gatewayIP string,
+	gatewayMAC string,
+	nextHop string,
+) error {
+	nbClient := o.client.NBClient()
+	if nbClient == nil {
+		return fmt.Errorf("NB client is not connected")
+	}
+
+	extSwitchName := GetExternalSwitchName(nodeName)
+	lrpName := GatewayRouterPortPrefix + nodeName
+	lspName := "etor-" + nodeName
+
+	// Get cluster router
+	router, err := o.GetLogicalRouter(ctx, ClusterRouterName)
+	if err != nil {
+		return fmt.Errorf("cluster router not found: %w", err)
+	}
+
+	// Check if router port already exists
+	existingLRP := &LogicalRouterPort{Name: lrpName}
+	err = nbClient.Get(ctx, existingLRP)
+	if err == nil {
+		klog.V(4).Infof("Gateway router port %s already exists", lrpName)
+		return nil
+	}
+	if err != client.ErrNotFound {
+		return fmt.Errorf("failed to check gateway router port: %w", err)
+	}
+
+	// Parse gateway IP to get network
+	ip := net.ParseIP(gatewayIP)
+	if ip == nil {
+		return fmt.Errorf("invalid gateway IP: %s", gatewayIP)
+	}
+
+	// Assume /24 network for simplicity
+	// In production, this should be configurable
+	network := fmt.Sprintf("%s/24", gatewayIP)
+
+	var ops []ovsdb.Operation
+
+	// Create router port to external switch
+	lrp := &LogicalRouterPort{
+		UUID:     BuildNamedUUID(lrpName),
+		Name:     lrpName,
+		MAC:      gatewayMAC,
+		Networks: []string{network},
+		ExternalIDs: map[string]string{
+			"k8s.ovn.org/kind": "gateway-router-port",
+			"k8s.ovn.org/node": nodeName,
+		},
+	}
+
+	createLrpOps, err := nbClient.Create(lrp)
+	if err != nil {
+		return fmt.Errorf("failed to create router port operation: %w", err)
+	}
+	ops = append(ops, createLrpOps...)
+
+	// Add router port to cluster router
+	mutateRouterOps, err := nbClient.Where(router).Mutate(router, model.Mutation{
+		Field:   &router.Ports,
+		Mutator: ovsdb.MutateOperationInsert,
+		Value:   []string{lrp.UUID},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create router mutation: %w", err)
+	}
+	ops = append(ops, mutateRouterOps...)
+
+	// Create switch port on external switch connecting to router
+	lsp := &LogicalSwitchPort{
+		UUID: BuildNamedUUID(lspName),
+		Name: lspName,
+		Type: "router",
+		Options: map[string]string{
+			"router-port": lrpName,
+		},
+		Addresses: []string{"router"},
+		ExternalIDs: map[string]string{
+			"k8s.ovn.org/router-port": lrpName,
+			"k8s.ovn.org/node":        nodeName,
+		},
+	}
+
+	createLspOps, err := nbClient.Create(lsp)
+	if err != nil {
+		return fmt.Errorf("failed to create switch port operation: %w", err)
+	}
+	ops = append(ops, createLspOps...)
+
+	// Get external switch
+	extSwitch := &LogicalSwitch{Name: extSwitchName}
+	err = nbClient.Get(ctx, extSwitch)
+	if err != nil {
+		return fmt.Errorf("failed to get external switch %s: %w", extSwitchName, err)
+	}
+
+	// Add switch port to external switch
+	mutateSwitchOps, err := nbClient.Where(extSwitch).Mutate(extSwitch, model.Mutation{
+		Field:   &extSwitch.Ports,
+		Mutator: ovsdb.MutateOperationInsert,
+		Value:   []string{lsp.UUID},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create switch mutation: %w", err)
+	}
+	ops = append(ops, mutateSwitchOps...)
+
+	// Execute transaction
+	results, err := nbClient.Transact(ctx, ops...)
+	if err != nil {
+		if isDuplicateError(err) {
+			klog.V(4).Infof("Gateway router port %s was created by another reconcile", lrpName)
+			return nil
+		}
+		return fmt.Errorf("failed to create gateway router to external: %w", err)
+	}
+
+	if err := checkTransactResults(results); err != nil {
+		if isDuplicateError(err) {
+			return nil
+		}
+		return fmt.Errorf("gateway router to external creation failed: %w", err)
+	}
+
+	klog.Infof("Created gateway router port %s connecting to external switch %s", lrpName, extSwitchName)
+
+	// Add default route via external gateway
+	if nextHop != "" {
+		if err := o.EnsureDefaultRouteViaExternal(ctx, nextHop, lrpName); err != nil {
+			return fmt.Errorf("failed to add default route: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// EnsureDefaultRouteViaExternal adds a default route via the external gateway port.
+func (o *LogicalRouterOps) EnsureDefaultRouteViaExternal(ctx context.Context, nextHop, outputPort string) error {
+	nbClient := o.client.NBClient()
+	if nbClient == nil {
+		return fmt.Errorf("NB client is not connected")
+	}
+
+	router, err := o.GetLogicalRouter(ctx, ClusterRouterName)
+	if err != nil {
+		return fmt.Errorf("cluster router not found: %w", err)
+	}
+
+	// Check if default route already exists
+	var routes []*LogicalRouterStaticRoute
+	err = nbClient.WhereCache(func(r *LogicalRouterStaticRoute) bool {
+		return r.IPPrefix == "0.0.0.0/0"
+	}).List(ctx, &routes)
+	if err != nil {
+		return fmt.Errorf("failed to list routes: %w", err)
+	}
+
+	for _, route := range routes {
+		for _, routeUUID := range router.StaticRoutes {
+			if routeUUID == route.UUID {
+				if route.Nexthop == nextHop {
+					klog.V(4).Infof("Default route already exists with nexthop %s", nextHop)
+					return nil
+				}
+				// Update existing route
+				route.Nexthop = nextHop
+				route.OutputPort = &outputPort
+				updateOps, err := nbClient.Where(route).Update(route, &route.Nexthop, &route.OutputPort)
+				if err != nil {
+					return fmt.Errorf("failed to update route: %w", err)
+				}
+				results, err := nbClient.Transact(ctx, updateOps...)
+				if err != nil {
+					return fmt.Errorf("failed to update default route: %w", err)
+				}
+				if err := checkTransactResults(results); err != nil {
+					return fmt.Errorf("default route update failed: %w", err)
+				}
+				klog.Infof("Updated default route nexthop to %s via %s", nextHop, outputPort)
+				return nil
+			}
+		}
+	}
+
+	// Create new default route
+	route := &LogicalRouterStaticRoute{
+		IPPrefix:   "0.0.0.0/0",
+		Nexthop:    nextHop,
+		OutputPort: &outputPort,
+		ExternalIDs: map[string]string{
+			"k8s.ovn.org/owner": "zstack-ovn-kubernetes",
+			"k8s.ovn.org/kind":  "default-route",
+		},
+	}
+
+	createOps, err := nbClient.Create(route)
+	if err != nil {
+		return fmt.Errorf("failed to create route operation: %w", err)
+	}
+
+	mutateOps, err := nbClient.Where(router).Mutate(router, model.Mutation{
+		Field:   &router.StaticRoutes,
+		Mutator: ovsdb.MutateOperationInsert,
+		Value:   []string{route.UUID},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create router mutation: %w", err)
+	}
+
+	ops := append(createOps, mutateOps...)
+	results, err := nbClient.Transact(ctx, ops...)
+	if err != nil {
+		return fmt.Errorf("failed to add default route: %w", err)
+	}
+
+	if err := checkTransactResults(results); err != nil {
+		return fmt.Errorf("default route addition failed: %w", err)
+	}
+
+	klog.Infof("Added default route 0.0.0.0/0 -> %s via %s", nextHop, outputPort)
+	return nil
 }

@@ -779,13 +779,22 @@ func (c *NodeController) ensureJoinNetwork(ctx context.Context) error {
 }
 
 // ensureDistributedGateway configures the distributed gateway for a node.
-// Each node acts as a gateway chassis, allowing pods to access external networks
-// through the node's physical IP.
+// This enables pods to access external networks through SNAT using the node's physical IP.
 //
-// This creates:
-// 1. A gateway chassis port on the join switch bound to this node
-// 2. A default route pointing to the first gateway chassis
-// 3. SNAT rules for the cluster CIDR
+// Architecture (simplified distributed gateway):
+//
+//	Pod -> subnet-switch -> ovn-cluster-router (SNAT to nodeIP) -> external-switch -> br-ex -> physical network
+//
+// This function automatically:
+// 1. Detects the default gateway interface and IP (if not configured)
+// 2. Configures OVS bridge mappings
+// 3. Creates external switch with localnet port
+// 4. Adds SNAT rules for the cluster CIDR
+// 5. Adds default route via external gateway
+//
+// Note: This is a simplified implementation compared to ovn-kubernetes's per-node
+// Gateway Router (GR_<node>) architecture. It relies on OVN's distributed gateway
+// capabilities and automatic detection of network configuration.
 func (c *NodeController) ensureDistributedGateway(ctx context.Context, node *corev1.Node) error {
 	if c.ovnClient == nil || !c.ovnClient.IsConnected() {
 		klog.V(4).Infof("OVN client not connected, skipping gateway configuration for node %s", node.Name)
@@ -796,25 +805,46 @@ func (c *NodeController) ensureDistributedGateway(ctx context.Context, node *cor
 		return fmt.Errorf("logical router ops not initialized")
 	}
 
-	// Get node's internal IP
+	// Get node's internal IP (used for SNAT)
 	nodeIP := c.getNodeInternalIP(node)
 	if nodeIP == "" {
 		klog.Warningf("No internal IP found for node %s, skipping gateway configuration", node.Name)
 		return nil
 	}
 
-	// Get chassis name (usually same as node name or hostname)
-	chassisName := node.Name
+	// Auto-detect or use configured gateway settings
+	var nextHop string
+	var physicalNetwork string
 
-	// Allocate join network IP for this node (100.64.0.x)
-	c.mu.Lock()
-	joinIP := fmt.Sprintf("100.64.0.%d", c.nextJoinIP)
-	c.nextJoinIP++
-	c.mu.Unlock()
+	// Check if gateway is explicitly configured
+	if c.config.Gateway.NextHop != "" {
+		nextHop = c.config.Gateway.NextHop
+		physicalNetwork = c.config.Gateway.Interface
+		if physicalNetwork == "" {
+			physicalNetwork = "external"
+		}
+		klog.V(4).Infof("Using configured gateway: nextHop=%s, physicalNetwork=%s", nextHop, physicalNetwork)
+	} else {
+		// Auto-detect gateway configuration
+		klog.V(4).Infof("Auto-detecting gateway configuration for node %s", node.Name)
 
-	// Create gateway chassis port on join switch
-	if err := c.lrOps.EnsureGatewayChassisPort(ctx, node.Name, chassisName, joinIP, nodeIP); err != nil {
-		return fmt.Errorf("failed to create gateway chassis port: %w", err)
+		physicalNetwork = c.config.Gateway.Interface
+		if physicalNetwork == "" {
+			physicalNetwork = "external"
+		}
+
+		gwInfo, err := AutoConfigureGateway(physicalNetwork)
+		if err != nil {
+			klog.Warningf("Failed to auto-configure gateway for node %s: %v, falling back to simple inference", node.Name, err)
+			// Fall back to simple gateway inference
+			nextHop = c.inferNodeGateway(nodeIP)
+		} else {
+			if gwInfo.GatewayIP != nil {
+				nextHop = gwInfo.GatewayIP.String()
+			}
+			klog.Infof("Auto-detected gateway for node %s: nextHop=%s, interface=%s, bridge=%s",
+				node.Name, nextHop, gwInfo.InterfaceName, gwInfo.BridgeName)
+		}
 	}
 
 	// Set up default route and SNAT (only for first node / gateway node)
@@ -826,20 +856,100 @@ func (c *NodeController) ensureDistributedGateway(ctx context.Context, node *cor
 	c.mu.Unlock()
 
 	if isFirstGateway {
-		// Add default route pointing to this gateway chassis
-		if err := c.lrOps.EnsureDefaultRoute(ctx, joinIP); err != nil {
-			return fmt.Errorf("failed to add default route: %w", err)
-		}
-
 		// Add SNAT rule for cluster CIDR
+		// This allows all pods to access external networks using the gateway node's IP
 		if err := c.lrOps.EnsureSNATForCluster(ctx, nodeIP, c.config.Network.ClusterCIDR); err != nil {
 			return fmt.Errorf("failed to add cluster SNAT: %w", err)
 		}
+		klog.Infof("Added SNAT rule: %s -> %s", c.config.Network.ClusterCIDR, nodeIP)
 
-		klog.Infof("Node %s configured as primary gateway with IP %s", node.Name, nodeIP)
+		// Configure external network connectivity
+		if nextHop != "" {
+			if err := c.ensureExternalConnectivity(ctx, node, nodeIP, nextHop, physicalNetwork); err != nil {
+				klog.Warningf("Failed to configure external connectivity for node %s: %v", node.Name, err)
+				// Don't fail - basic SNAT is still configured, external access might work via other means
+				// Fall back to join network routing
+				joinRouterIP := "100.64.0.1"
+				if err := c.lrOps.EnsureDefaultRoute(ctx, joinRouterIP); err != nil {
+					klog.Warningf("Failed to add default route via join network: %v", err)
+				}
+			}
+		} else {
+			klog.Warningf("No next hop configured for node %s, using join network for routing", node.Name)
+			// Add a default route via join network for internal routing
+			joinRouterIP := "100.64.0.1"
+			if err := c.lrOps.EnsureDefaultRoute(ctx, joinRouterIP); err != nil {
+				klog.Warningf("Failed to add default route via join network: %v", err)
+			}
+		}
+
+		klog.Infof("Node %s configured as primary gateway with SNAT IP %s", node.Name, nodeIP)
 	} else {
-		klog.Infof("Node %s configured as backup gateway chassis", node.Name)
+		klog.V(4).Infof("Node %s is not the primary gateway, skipping SNAT configuration", node.Name)
 	}
+
+	return nil
+}
+
+// inferNodeGateway infers the default gateway IP from the node's IP.
+// This assumes a common pattern where the gateway is x.x.x.1 in the node's subnet.
+func (c *NodeController) inferNodeGateway(nodeIP string) string {
+	ip := net.ParseIP(nodeIP)
+	if ip == nil {
+		return ""
+	}
+
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return "" // IPv6 not supported in this simple implementation
+	}
+
+	// Assume /24 subnet and gateway at .1
+	// This is a common pattern but may not work for all networks
+	gateway := net.IPv4(ip4[0], ip4[1], ip4[2], 1)
+	return gateway.String()
+}
+
+// ensureExternalConnectivity configures the node's OVS bridge for external traffic.
+// This sets up the necessary OVN resources to allow traffic to reach the physical network.
+//
+// Architecture:
+//
+//	cluster-router -> external-switch (ext_<node>) -> localnet port -> br-ex -> physical network
+//
+// This creates:
+// 1. External switch with localnet port connecting to physical network
+// 2. Router port on cluster router connecting to external switch
+// 3. Default route via external gateway
+func (c *NodeController) ensureExternalConnectivity(ctx context.Context, node *corev1.Node, nodeIP, nextHop, physicalNetwork string) error {
+	if c.lrOps == nil {
+		return fmt.Errorf("logical router ops not initialized")
+	}
+
+	// Use provided physical network name or default
+	if physicalNetwork == "" {
+		physicalNetwork = "external"
+	}
+
+	// Get VLAN ID from config (0 for untagged)
+	vlanID := c.config.Gateway.VLANID
+
+	// Create external switch with localnet port
+	_, err := c.lrOps.EnsureExternalSwitch(ctx, node.Name, physicalNetwork, vlanID)
+	if err != nil {
+		return fmt.Errorf("failed to create external switch: %w", err)
+	}
+
+	// Generate MAC address for gateway port
+	gatewayMAC := c.generateRouterPortMAC(net.ParseIP(nodeIP))
+
+	// Connect cluster router to external switch
+	if err := c.lrOps.EnsureGatewayRouterToExternal(ctx, node.Name, nodeIP, gatewayMAC, nextHop); err != nil {
+		return fmt.Errorf("failed to connect router to external: %w", err)
+	}
+
+	klog.Infof("External connectivity configured for node %s: nodeIP=%s, nextHop=%s, physicalNetwork=%s",
+		node.Name, nodeIP, nextHop, physicalNetwork)
 
 	return nil
 }
