@@ -22,10 +22,12 @@ package ovndb
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/ovn-org/libovsdb/client"
 	"github.com/ovn-org/libovsdb/model"
 	"github.com/ovn-org/libovsdb/ovsdb"
+	"k8s.io/klog/v2"
 )
 
 // LogicalSwitchOps provides operations on OVN Logical Switches
@@ -295,6 +297,7 @@ func (o *LogicalSwitchOps) DeleteLogicalSwitchOps(name string) ([]ovsdb.Operatio
 //
 // If the switch exists, it updates the specified fields.
 // If the switch doesn't exist, it creates a new one.
+// This is an idempotent operation that handles cache sync issues.
 //
 // Parameters:
 //   - ctx: Context for cancellation
@@ -312,21 +315,76 @@ func (o *LogicalSwitchOps) CreateOrUpdateLogicalSwitch(ctx context.Context, ls *
 		return fmt.Errorf("NB client is not connected")
 	}
 
-	// Check if switch exists
-	existing, err := o.GetLogicalSwitch(ctx, ls.Name)
-	if err != nil && !IsNotFound(err) {
-		return err
-	}
+	// Try to get existing switch using client.Get (uses index)
+	existing := &LogicalSwitch{Name: ls.Name}
+	err := nbClient.Get(ctx, existing)
 
-	if existing != nil {
-		// Update existing switch
+	if err == nil {
+		// Switch exists, update it if needed
 		ls.UUID = existing.UUID
+		klog.V(4).Infof("Logical switch %s already exists with UUID %s", ls.Name, existing.UUID)
 		return o.UpdateLogicalSwitch(ctx, ls)
 	}
 
-	// Create new switch
-	_, err = o.CreateLogicalSwitch(ctx, ls.Name, ls.OtherConfig, ls.ExternalIDs)
-	return err
+	if err != client.ErrNotFound {
+		return fmt.Errorf("failed to check existing switch: %w", err)
+	}
+
+	// Switch doesn't exist, create it with a named UUID
+	ls.UUID = BuildNamedUUID(ls.Name)
+
+	ops, err := nbClient.Create(ls)
+	if err != nil {
+		return fmt.Errorf("failed to create switch operation: %w", err)
+	}
+
+	results, err := nbClient.Transact(ctx, ops...)
+	if err != nil {
+		// Check if it's a duplicate error (another reconcile created it)
+		if isDuplicateSwitchError(err) {
+			klog.V(4).Infof("Switch %s was created by another reconcile, this is expected", ls.Name)
+			return nil
+		}
+		return fmt.Errorf("failed to create switch: %w", err)
+	}
+
+	if err := checkSwitchTransactResults(results); err != nil {
+		// Check if it's a constraint violation (duplicate)
+		if isDuplicateSwitchError(err) {
+			klog.V(4).Infof("Switch %s already exists (constraint violation), this is expected", ls.Name)
+			return nil
+		}
+		return fmt.Errorf("switch creation failed: %w", err)
+	}
+
+	// Set the real UUID from the transaction result
+	if len(results) > 0 && results[0].UUID.GoUUID != "" {
+		ls.UUID = results[0].UUID.GoUUID
+	}
+
+	klog.Infof("Created logical switch %s with UUID %s", ls.Name, ls.UUID)
+	return nil
+}
+
+// isDuplicateSwitchError checks if an error indicates a duplicate/constraint violation
+func isDuplicateSwitchError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "constraint violation") ||
+		strings.Contains(errStr, "duplicate") ||
+		strings.Contains(errStr, "already exists")
+}
+
+// checkSwitchTransactResults checks transaction results for errors
+func checkSwitchTransactResults(results []ovsdb.OperationResult) error {
+	for i, result := range results {
+		if result.Error != "" {
+			return fmt.Errorf("operation %d failed: %s - %s", i, result.Error, result.Details)
+		}
+	}
+	return nil
 }
 
 // SetOtherConfig sets other_config values on a Logical Switch

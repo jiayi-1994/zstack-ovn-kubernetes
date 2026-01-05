@@ -76,23 +76,11 @@ func NewLogicalRouterOps(c *Client) *LogicalRouterOps {
 // The cluster router is the central routing point for all node subnets.
 // It enables Pod-to-Pod communication across nodes and provides the gateway
 // for external traffic.
+//
+// This function is idempotent - it uses CreateOrUpdate pattern to avoid
+// creating duplicate routers due to cache sync issues.
 func (o *LogicalRouterOps) CreateClusterRouter(ctx context.Context) (*LogicalRouter, error) {
-	// Check if router already exists using WhereCache (more reliable than Get for cache lookups)
-	var existing []*LogicalRouter
-	err := o.client.nbClient.WhereCache(func(lr *LogicalRouter) bool {
-		return lr.Name == ClusterRouterName
-	}).List(ctx, &existing)
-	if err != nil {
-		return nil, fmt.Errorf("failed to check existing router: %w", err)
-	}
-	if len(existing) > 0 {
-		klog.V(4).Infof("Cluster router %s already exists", ClusterRouterName)
-		return existing[0], nil
-	}
-
-	// Create the router with a named UUID
 	router := &LogicalRouter{
-		UUID: BuildNamedUUID(ClusterRouterName),
 		Name: ClusterRouterName,
 		ExternalIDs: map[string]string{
 			"k8s.ovn.org/kind":  "cluster-router",
@@ -103,27 +91,79 @@ func (o *LogicalRouterOps) CreateClusterRouter(ctx context.Context) (*LogicalRou
 		},
 	}
 
+	// Use CreateOrUpdate pattern (like ovn-kubernetes) to ensure idempotency
+	// This avoids duplicate creation due to cache sync issues
+	if err := o.CreateOrUpdateLogicalRouter(ctx, router); err != nil {
+		return nil, fmt.Errorf("failed to create/update cluster router: %w", err)
+	}
+
+	klog.Infof("Ensured cluster router %s", ClusterRouterName)
+	return router, nil
+}
+
+// CreateOrUpdateLogicalRouter creates a logical router if it doesn't exist, or updates it if it does.
+// This is the idempotent pattern used by ovn-kubernetes.
+func (o *LogicalRouterOps) CreateOrUpdateLogicalRouter(ctx context.Context, router *LogicalRouter) error {
+	// First, try to get the existing router by name
+	existing := &LogicalRouter{Name: router.Name}
+	err := o.client.nbClient.Get(ctx, existing)
+
+	if err == nil {
+		// Router exists, update it if needed
+		router.UUID = existing.UUID
+		klog.V(4).Infof("Logical router %s already exists with UUID %s", router.Name, existing.UUID)
+		return nil
+	}
+
+	if err != client.ErrNotFound {
+		return fmt.Errorf("failed to check existing router: %w", err)
+	}
+
+	// Router doesn't exist, create it with a named UUID
+	router.UUID = BuildNamedUUID(router.Name)
+
 	ops, err := o.client.nbClient.Create(router)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create router operation: %w", err)
+		return fmt.Errorf("failed to create router operation: %w", err)
 	}
 
 	results, err := o.client.nbClient.Transact(ctx, ops...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create cluster router: %w", err)
+		// Check if it's a duplicate error (another reconcile created it)
+		if isDuplicateError(err) {
+			klog.V(4).Infof("Router %s was created by another reconcile, this is expected", router.Name)
+			return nil
+		}
+		return fmt.Errorf("failed to create router: %w", err)
 	}
 
 	if err := checkTransactResults(results); err != nil {
-		return nil, fmt.Errorf("cluster router creation failed: %w", err)
+		// Check if it's a constraint violation (duplicate)
+		if isDuplicateError(err) {
+			klog.V(4).Infof("Router %s already exists (constraint violation), this is expected", router.Name)
+			return nil
+		}
+		return fmt.Errorf("router creation failed: %w", err)
 	}
 
-	// Set the real UUID from the transaction result (ovn-kubernetes pattern)
+	// Set the real UUID from the transaction result
 	if len(results) > 0 && results[0].UUID.GoUUID != "" {
 		router.UUID = results[0].UUID.GoUUID
 	}
 
-	klog.Infof("Created cluster router %s with UUID %s", ClusterRouterName, router.UUID)
-	return router, nil
+	klog.Infof("Created logical router %s with UUID %s", router.Name, router.UUID)
+	return nil
+}
+
+// isDuplicateError checks if an error indicates a duplicate/constraint violation
+func isDuplicateError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "constraint violation") ||
+		strings.Contains(errStr, "duplicate") ||
+		strings.Contains(errStr, "already exists")
 }
 
 // GetLogicalRouter retrieves a logical router by name.
@@ -497,19 +537,20 @@ func (o *LogicalRouterOps) EnsureJoinSwitch(ctx context.Context) error {
 		return fmt.Errorf("NB client is not connected")
 	}
 
-	// Check if join switch already exists
+	// Check if join switch already exists using Get
 	ls := &LogicalSwitch{Name: JoinSwitchName}
 	err := nbClient.Get(ctx, ls)
 	if err == nil {
-		klog.V(4).Infof("Join switch %s already exists", JoinSwitchName)
+		klog.V(4).Infof("Join switch %s already exists with UUID %s", JoinSwitchName, ls.UUID)
 		return nil
 	}
 	if err != client.ErrNotFound {
 		return fmt.Errorf("failed to check join switch: %w", err)
 	}
 
-	// Create join switch
+	// Create join switch with named UUID
 	ls = &LogicalSwitch{
+		UUID: BuildNamedUUID(JoinSwitchName),
 		Name: JoinSwitchName,
 		OtherConfig: map[string]string{
 			"subnet":      "100.64.0.0/16",
@@ -528,10 +569,19 @@ func (o *LogicalRouterOps) EnsureJoinSwitch(ctx context.Context) error {
 
 	results, err := nbClient.Transact(ctx, ops...)
 	if err != nil {
+		// Check if it's a duplicate error
+		if isDuplicateError(err) {
+			klog.V(4).Infof("Join switch %s was created by another reconcile", JoinSwitchName)
+			return nil
+		}
 		return fmt.Errorf("failed to create join switch: %w", err)
 	}
 
 	if err := checkTransactResults(results); err != nil {
+		if isDuplicateError(err) {
+			klog.V(4).Infof("Join switch %s already exists (constraint violation)", JoinSwitchName)
+			return nil
+		}
 		return fmt.Errorf("join switch creation failed: %w", err)
 	}
 
@@ -561,10 +611,23 @@ func (o *LogicalRouterOps) EnsureJoinRouterPort(ctx context.Context) error {
 		return fmt.Errorf("failed to check join router port: %w", err)
 	}
 
-	// Get the cluster router
-	router, err := o.GetLogicalRouter(ctx, ClusterRouterName)
+	// Get the cluster router - use WhereCache as fallback if Get fails due to cache sync
+	router := &LogicalRouter{Name: ClusterRouterName}
+	err = nbClient.Get(ctx, router)
 	if err != nil {
-		return fmt.Errorf("cluster router not found: %w", err)
+		if err == client.ErrNotFound {
+			// Try WhereCache as fallback
+			var routers []*LogicalRouter
+			err = nbClient.WhereCache(func(lr *LogicalRouter) bool {
+				return lr.Name == ClusterRouterName
+			}).List(ctx, &routers)
+			if err != nil || len(routers) == 0 {
+				return fmt.Errorf("cluster router not found: %w", err)
+			}
+			router = routers[0]
+		} else {
+			return fmt.Errorf("failed to get cluster router: %w", err)
+		}
 	}
 
 	// Create router port
