@@ -58,6 +58,7 @@ type SubnetReconciler struct {
 	config       *config.Config
 	ovnClient    *ovndb.Client
 	lsOps        *ovndb.LogicalSwitchOps
+	lrOps        *ovndb.LogicalRouterOps
 	zstackCompat *ovndb.ZStackCompatibility
 	allocators   map[string]*allocator.SubnetAllocator
 	allocatorsMu sync.RWMutex
@@ -78,6 +79,7 @@ func NewSubnetReconciler(
 		config:       cfg,
 		ovnClient:    ovnClient,
 		lsOps:        ovndb.NewLogicalSwitchOps(ovnClient),
+		lrOps:        ovndb.NewLogicalRouterOps(ovnClient),
 		zstackCompat: ovndb.NewZStackCompatibility(ovnClient),
 		allocators:   make(map[string]*allocator.SubnetAllocator),
 	}
@@ -142,6 +144,13 @@ func (r *SubnetReconciler) reconcileSubnet(ctx context.Context, subnet *networkv
 		if err := r.ensureLogicalSwitch(ctx, subnet, lsName); err != nil {
 			return ctrl.Result{}, err
 		}
+	}
+
+	// Connect the Logical Switch to the Cluster Router for L3 connectivity
+	if err := r.ensureRouterConnection(ctx, subnet, lsName); err != nil {
+		log.Error(err, "Failed to connect Logical Switch to router")
+		r.recorder.Event(subnet, "Warning", "RouterConnectionFailed", err.Error())
+		return ctrl.Result{}, err
 	}
 
 	if err := r.ensureIPAllocator(subnet); err != nil {
@@ -501,4 +510,70 @@ func updateCondition(conditions []metav1.Condition, newCondition metav1.Conditio
 		}
 	}
 	return append(conditions, newCondition)
+}
+
+// ensureRouterConnection connects the Subnet's Logical Switch to the Cluster Router.
+// This creates:
+// 1. A Logical Router Port on the cluster router with the gateway IP
+// 2. A Logical Switch Port on the subnet switch connecting to the router
+//
+// This enables L3 routing between the subnet and other subnets/external networks.
+func (r *SubnetReconciler) ensureRouterConnection(ctx context.Context, subnet *networkv1.Subnet, lsName string) error {
+	log := klog.FromContext(ctx).WithValues("subnet", subnet.Name, "logicalSwitch", lsName)
+
+	if r.lrOps == nil {
+		log.V(4).Info("LogicalRouterOps not initialized, skipping router connection")
+		return nil
+	}
+
+	// Check if cluster router exists
+	_, err := r.lrOps.GetLogicalRouter(ctx, ovndb.ClusterRouterName)
+	if err != nil {
+		if ovndb.IsNotFound(err) {
+			log.V(4).Info("Cluster router not found yet, will retry later")
+			return fmt.Errorf("cluster router %s not found, will retry", ovndb.ClusterRouterName)
+		}
+		return fmt.Errorf("failed to get cluster router: %w", err)
+	}
+
+	// Generate MAC address for router port based on gateway IP
+	gatewayIP := subnet.Spec.Gateway
+	mac := generateRouterPortMAC(gatewayIP)
+
+	log.V(4).Info("Ensuring router connection",
+		"gateway", gatewayIP,
+		"cidr", subnet.Spec.CIDR,
+		"mac", mac)
+
+	// Create router port connecting switch to cluster router
+	if err := r.lrOps.EnsureRouterPortToSwitch(ctx, lsName, gatewayIP, subnet.Spec.CIDR, mac); err != nil {
+		return fmt.Errorf("failed to ensure router port for switch %s: %w", lsName, err)
+	}
+
+	log.Info("Connected Logical Switch to cluster router",
+		"switch", lsName,
+		"gateway", gatewayIP)
+	r.recorder.Event(subnet, "Normal", "RouterConnected",
+		fmt.Sprintf("Connected Logical Switch %s to cluster router with gateway %s", lsName, gatewayIP))
+
+	return nil
+}
+
+// generateRouterPortMAC generates a MAC address for a router port based on the gateway IP.
+// Format: 0a:58:xx:xx:xx:xx where xx:xx:xx:xx is derived from the IP
+func generateRouterPortMAC(ipStr string) string {
+	// Parse IP
+	parts := strings.Split(ipStr, ".")
+	if len(parts) != 4 {
+		return "0a:58:00:00:00:01"
+	}
+
+	var octets [4]int
+	for i, p := range parts {
+		var v int
+		fmt.Sscanf(p, "%d", &v)
+		octets[i] = v
+	}
+
+	return fmt.Sprintf("0a:58:%02x:%02x:%02x:%02x", octets[0], octets[1], octets[2], octets[3])
 }
