@@ -298,11 +298,24 @@ func (o *LogicalRouterOps) EnsureRouterPortToSwitch(
 		}
 		ops = append(ops, createOps...)
 
-		// Get the switch
+		// Get the switch - use WhereCache as fallback if Get fails due to cache sync
 		ls := &LogicalSwitch{Name: switchName}
 		err = o.client.nbClient.Get(ctx, ls)
 		if err != nil {
-			return fmt.Errorf("failed to get switch %s: %w", switchName, err)
+			if err == client.ErrNotFound {
+				// Try WhereCache as fallback for cache sync issues
+				var switches []*LogicalSwitch
+				err = o.client.nbClient.WhereCache(func(s *LogicalSwitch) bool {
+					return s.Name == switchName
+				}).List(ctx, &switches)
+				if err != nil || len(switches) == 0 {
+					return fmt.Errorf("failed to get switch %s: object not found (cache may not be synced yet)", switchName)
+				}
+				ls = switches[0]
+				klog.V(4).Infof("Found switch %s via WhereCache (UUID: %s)", switchName, ls.UUID)
+			} else {
+				return fmt.Errorf("failed to get switch %s: %w", switchName, err)
+			}
 		}
 
 		// Add port to switch
@@ -503,120 +516,166 @@ func checkTransactResults(results []ovsdb.OperationResult) error {
 	return nil
 }
 
-// EnsureJoinSwitch creates the join switch that connects the cluster router to gateway chassis.
-// The join switch acts as a transit network between the cluster router and external networks.
-//
-// Architecture:
-//
-//	┌─────────────────────────────────────────────────────────────────────────────┐
-//	│                         ovn-cluster-router                                   │
-//	│                                                                              │
-//	│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐                  │
-//	│  │ rtos-node1   │    │ rtos-node2   │    │ rtoj-router  │ (100.64.0.1)     │
-//	│  └──────┬───────┘    └──────┬───────┘    └──────┬───────┘                  │
-//	└─────────┼───────────────────┼───────────────────┼───────────────────────────┘
-//	          │                   │                   │
-//	          ▼                   ▼                   ▼
-//	┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
-//	│  node-1 Switch  │  │  node-2 Switch  │  │   join Switch   │
-//	│  10.244.0.0/24  │  │  10.244.1.0/24  │  │  100.64.0.0/16  │
-//	└─────────────────┘  └─────────────────┘  └────────┬────────┘
-//	                                                   │
-//	                                          ┌────────┴────────┐
-//	                                          │ jtor-node1      │ (100.64.0.2)
-//	                                          │ Gateway Chassis │
-//	                                          └────────┬────────┘
-//	                                                   │
-//	                                          ┌────────┴────────┐
-//	                                          │  Node (物理网卡) │
-//	                                          │  192.168.x.x    │
-//	                                          └─────────────────┘
-func (o *LogicalRouterOps) EnsureJoinSwitch(ctx context.Context) error {
+// EnsureJoinSwitchAndRouterPort creates the join switch and router port in a single transaction.
+// This avoids cache sync issues by creating all objects in one atomic operation.
+// Returns the join switch for use by other functions that need to add ports to it.
+func (o *LogicalRouterOps) EnsureJoinSwitchAndRouterPort(ctx context.Context) (*LogicalSwitch, error) {
 	nbClient := o.client.NBClient()
 	if nbClient == nil {
-		return fmt.Errorf("NB client is not connected")
-	}
-
-	// Check if join switch already exists using Get
-	ls := &LogicalSwitch{Name: JoinSwitchName}
-	err := nbClient.Get(ctx, ls)
-	if err == nil {
-		klog.V(4).Infof("Join switch %s already exists with UUID %s", JoinSwitchName, ls.UUID)
-		return nil
-	}
-	if err != client.ErrNotFound {
-		return fmt.Errorf("failed to check join switch: %w", err)
-	}
-
-	// Create join switch with named UUID
-	ls = &LogicalSwitch{
-		UUID: BuildNamedUUID(JoinSwitchName),
-		Name: JoinSwitchName,
-		OtherConfig: map[string]string{
-			"subnet":      "100.64.0.0/16",
-			"exclude_ips": "100.64.0.1",
-		},
-		ExternalIDs: map[string]string{
-			"k8s.ovn.org/kind":  "join-switch",
-			"k8s.ovn.org/owner": "zstack-ovn-kubernetes",
-		},
-	}
-
-	ops, err := nbClient.Create(ls)
-	if err != nil {
-		return fmt.Errorf("failed to create join switch operation: %w", err)
-	}
-
-	results, err := nbClient.Transact(ctx, ops...)
-	if err != nil {
-		// Check if it's a duplicate error
-		if isDuplicateError(err) {
-			klog.V(4).Infof("Join switch %s was created by another reconcile", JoinSwitchName)
-			return nil
-		}
-		return fmt.Errorf("failed to create join switch: %w", err)
-	}
-
-	if err := checkTransactResults(results); err != nil {
-		if isDuplicateError(err) {
-			klog.V(4).Infof("Join switch %s already exists (constraint violation)", JoinSwitchName)
-			return nil
-		}
-		return fmt.Errorf("join switch creation failed: %w", err)
-	}
-
-	klog.Infof("Created join switch %s", JoinSwitchName)
-	return nil
-}
-
-// EnsureJoinRouterPort creates the router port connecting cluster router to join switch.
-// This port has IP 100.64.0.1 and serves as the gateway for the join network.
-func (o *LogicalRouterOps) EnsureJoinRouterPort(ctx context.Context) error {
-	nbClient := o.client.NBClient()
-	if nbClient == nil {
-		return fmt.Errorf("NB client is not connected")
+		return nil, fmt.Errorf("NB client is not connected")
 	}
 
 	lrpName := JoinRouterPortName
 	lspName := JoinSwitchPortPrefix + "GR"
 
-	// Check if router port already exists
-	lrp := &LogicalRouterPort{Name: lrpName}
-	err := nbClient.Get(ctx, lrp)
+	// Check if join switch already exists
+	ls := &LogicalSwitch{Name: JoinSwitchName}
+	err := nbClient.Get(ctx, ls)
 	if err == nil {
-		klog.V(4).Infof("Join router port %s already exists", lrpName)
-		return nil
+		klog.V(4).Infof("Join switch %s already exists with UUID %s", JoinSwitchName, ls.UUID)
+		// Switch exists, check if router port exists
+		lrp := &LogicalRouterPort{Name: lrpName}
+		if err := nbClient.Get(ctx, lrp); err == nil {
+			klog.V(4).Infof("Join router port %s already exists", lrpName)
+			return ls, nil
+		}
+		// Router port doesn't exist, create it
+		return ls, o.createJoinRouterPortOnly(ctx, ls)
 	}
 	if err != client.ErrNotFound {
-		return fmt.Errorf("failed to check join router port: %w", err)
+		return nil, fmt.Errorf("failed to check join switch: %w", err)
 	}
 
-	// Get the cluster router - use WhereCache as fallback if Get fails due to cache sync
+	// Get the cluster router first
 	router := &LogicalRouter{Name: ClusterRouterName}
 	err = nbClient.Get(ctx, router)
 	if err != nil {
 		if err == client.ErrNotFound {
-			// Try WhereCache as fallback
+			var routers []*LogicalRouter
+			err = nbClient.WhereCache(func(lr *LogicalRouter) bool {
+				return lr.Name == ClusterRouterName
+			}).List(ctx, &routers)
+			if err != nil || len(routers) == 0 {
+				return nil, fmt.Errorf("cluster router not found: %w", err)
+			}
+			router = routers[0]
+		} else {
+			return nil, fmt.Errorf("failed to get cluster router: %w", err)
+		}
+	}
+
+	// Build all operations in a single transaction
+	var ops []ovsdb.Operation
+
+	// 1. Create join switch with named UUID
+	ls = &LogicalSwitch{
+		UUID:        BuildNamedUUID(JoinSwitchName),
+		Name:        JoinSwitchName,
+		OtherConfig: map[string]string{"subnet": "100.64.0.0/16", "exclude_ips": "100.64.0.1"},
+		ExternalIDs: map[string]string{"k8s.ovn.org/kind": "join-switch", "k8s.ovn.org/owner": "zstack-ovn-kubernetes"},
+	}
+	createSwitchOps, err := nbClient.Create(ls)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create join switch operation: %w", err)
+	}
+	ops = append(ops, createSwitchOps...)
+
+	// 2. Create router port with named UUID
+	lrp := &LogicalRouterPort{
+		UUID:        BuildNamedUUID(lrpName),
+		Name:        lrpName,
+		MAC:         "0a:58:64:40:00:01",
+		Networks:    []string{"100.64.0.1/16"},
+		ExternalIDs: map[string]string{"k8s.ovn.org/kind": "join-router-port"},
+	}
+	createLrpOps, err := nbClient.Create(lrp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create router port operation: %w", err)
+	}
+	ops = append(ops, createLrpOps...)
+
+	// 3. Add router port to cluster router
+	mutateRouterOps, err := nbClient.Where(router).Mutate(router, model.Mutation{
+		Field:   &router.Ports,
+		Mutator: ovsdb.MutateOperationInsert,
+		Value:   []string{lrp.UUID},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create router mutation: %w", err)
+	}
+	ops = append(ops, mutateRouterOps...)
+
+	// 4. Create switch port on join switch with named UUID
+	lsp := &LogicalSwitchPort{
+		UUID:        BuildNamedUUID(lspName),
+		Name:        lspName,
+		Type:        "router",
+		Options:     map[string]string{"router-port": lrpName},
+		Addresses:   []string{"router"},
+		ExternalIDs: map[string]string{"k8s.ovn.org/router-port": lrpName},
+	}
+	createLspOps, err := nbClient.Create(lsp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create switch port operation: %w", err)
+	}
+	ops = append(ops, createLspOps...)
+
+	// 5. Add switch port to join switch using named UUID
+	mutateSwitchOps, err := nbClient.Where(&LogicalSwitch{UUID: ls.UUID}).Mutate(ls, model.Mutation{
+		Field:   &ls.Ports,
+		Mutator: ovsdb.MutateOperationInsert,
+		Value:   []string{lsp.UUID},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create switch mutation: %w", err)
+	}
+	ops = append(ops, mutateSwitchOps...)
+
+	// Execute all operations in a single transaction
+	results, err := nbClient.Transact(ctx, ops...)
+	if err != nil {
+		if isDuplicateError(err) {
+			klog.V(4).Infof("Join switch/router port was created by another reconcile")
+			existing := &LogicalSwitch{Name: JoinSwitchName}
+			if getErr := nbClient.Get(ctx, existing); getErr == nil {
+				return existing, nil
+			}
+			return ls, nil
+		}
+		return nil, fmt.Errorf("failed to create join network: %w", err)
+	}
+
+	if err := checkTransactResults(results); err != nil {
+		if isDuplicateError(err) {
+			klog.V(4).Infof("Join switch/router port already exists (constraint violation)")
+			existing := &LogicalSwitch{Name: JoinSwitchName}
+			if getErr := nbClient.Get(ctx, existing); getErr == nil {
+				return existing, nil
+			}
+			return ls, nil
+		}
+		return nil, fmt.Errorf("join network creation failed: %w", err)
+	}
+
+	if len(results) > 0 && results[0].UUID.GoUUID != "" {
+		ls.UUID = results[0].UUID.GoUUID
+	}
+
+	klog.Infof("Created join switch %s and router port %s in single transaction", JoinSwitchName, lrpName)
+	return ls, nil
+}
+
+// createJoinRouterPortOnly creates only the router port when the switch already exists
+func (o *LogicalRouterOps) createJoinRouterPortOnly(ctx context.Context, joinSwitch *LogicalSwitch) error {
+	nbClient := o.client.NBClient()
+	lrpName := JoinRouterPortName
+	lspName := JoinSwitchPortPrefix + "GR"
+
+	// Get the cluster router
+	router := &LogicalRouter{Name: ClusterRouterName}
+	err := nbClient.Get(ctx, router)
+	if err != nil {
+		if err == client.ErrNotFound {
 			var routers []*LogicalRouter
 			err = nbClient.WhereCache(func(lr *LogicalRouter) bool {
 				return lr.Name == ClusterRouterName
@@ -630,26 +689,26 @@ func (o *LogicalRouterOps) EnsureJoinRouterPort(ctx context.Context) error {
 		}
 	}
 
+	var ops []ovsdb.Operation
+
 	// Create router port
-	lrp = &LogicalRouterPort{
+	lrp := &LogicalRouterPort{
+		UUID:     BuildNamedUUID(lrpName),
 		Name:     lrpName,
-		MAC:      "0a:58:64:40:00:01", // 100.64.0.1 encoded
+		MAC:      "0a:58:64:40:00:01",
 		Networks: []string{"100.64.0.1/16"},
 		ExternalIDs: map[string]string{
 			"k8s.ovn.org/kind": "join-router-port",
 		},
 	}
-
-	var ops []ovsdb.Operation
-
-	createOps, err := nbClient.Create(lrp)
+	createLrpOps, err := nbClient.Create(lrp)
 	if err != nil {
 		return fmt.Errorf("failed to create router port operation: %w", err)
 	}
-	ops = append(ops, createOps...)
+	ops = append(ops, createLrpOps...)
 
-	// Add port to router
-	mutateOps, err := nbClient.Where(router).Mutate(router, model.Mutation{
+	// Add to router
+	mutateRouterOps, err := nbClient.Where(router).Mutate(router, model.Mutation{
 		Field:   &router.Ports,
 		Mutator: ovsdb.MutateOperationInsert,
 		Value:   []string{lrp.UUID},
@@ -657,10 +716,11 @@ func (o *LogicalRouterOps) EnsureJoinRouterPort(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to create router mutation: %w", err)
 	}
-	ops = append(ops, mutateOps...)
+	ops = append(ops, mutateRouterOps...)
 
-	// Create corresponding switch port on join switch
+	// Create switch port
 	lsp := &LogicalSwitchPort{
+		UUID: BuildNamedUUID(lspName),
 		Name: lspName,
 		Type: "router",
 		Options: map[string]string{
@@ -671,41 +731,69 @@ func (o *LogicalRouterOps) EnsureJoinRouterPort(ctx context.Context) error {
 			"k8s.ovn.org/router-port": lrpName,
 		},
 	}
-
 	createLspOps, err := nbClient.Create(lsp)
 	if err != nil {
 		return fmt.Errorf("failed to create switch port operation: %w", err)
 	}
 	ops = append(ops, createLspOps...)
 
-	// Add port to join switch
-	ls := &LogicalSwitch{Name: JoinSwitchName}
-	err = nbClient.Get(ctx, ls)
-	if err != nil {
-		return fmt.Errorf("failed to get join switch: %w", err)
-	}
-
-	mutateLsOps, err := nbClient.Where(ls).Mutate(ls, model.Mutation{
-		Field:   &ls.Ports,
+	// Add to switch - joinSwitch already has a real UUID
+	mutateSwitchOps, err := nbClient.Where(joinSwitch).Mutate(joinSwitch, model.Mutation{
+		Field:   &joinSwitch.Ports,
 		Mutator: ovsdb.MutateOperationInsert,
 		Value:   []string{lsp.UUID},
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create switch mutation: %w", err)
 	}
-	ops = append(ops, mutateLsOps...)
+	ops = append(ops, mutateSwitchOps...)
 
 	results, err := nbClient.Transact(ctx, ops...)
 	if err != nil {
+		if isDuplicateError(err) {
+			klog.V(4).Infof("Join router port was created by another reconcile")
+			return nil
+		}
 		return fmt.Errorf("failed to create join router port: %w", err)
 	}
 
 	if err := checkTransactResults(results); err != nil {
+		if isDuplicateError(err) {
+			return nil
+		}
 		return fmt.Errorf("join router port creation failed: %w", err)
 	}
 
 	klog.Infof("Created join router port %s", lrpName)
 	return nil
+}
+
+// EnsureJoinSwitch is kept for backward compatibility but now delegates to EnsureJoinSwitchAndRouterPort
+// Deprecated: Use EnsureJoinSwitchAndRouterPort instead
+func (o *LogicalRouterOps) EnsureJoinSwitch(ctx context.Context) (*LogicalSwitch, error) {
+	return o.EnsureJoinSwitchAndRouterPort(ctx)
+}
+
+// EnsureJoinRouterPort is kept for backward compatibility
+// Deprecated: Use EnsureJoinSwitchAndRouterPort instead
+func (o *LogicalRouterOps) EnsureJoinRouterPort(ctx context.Context, joinSwitch *LogicalSwitch) error {
+	// Check if router port already exists
+	nbClient := o.client.NBClient()
+	if nbClient == nil {
+		return fmt.Errorf("NB client is not connected")
+	}
+
+	lrp := &LogicalRouterPort{Name: JoinRouterPortName}
+	err := nbClient.Get(ctx, lrp)
+	if err == nil {
+		klog.V(4).Infof("Join router port %s already exists", JoinRouterPortName)
+		return nil
+	}
+	if err != client.ErrNotFound {
+		return fmt.Errorf("failed to check join router port: %w", err)
+	}
+
+	return o.createJoinRouterPortOnly(ctx, joinSwitch)
 }
 
 // EnsureGatewayChassisPort creates a gateway chassis port on the join switch for a node.
@@ -783,11 +871,24 @@ func (o *LogicalRouterOps) EnsureGatewayChassisPort(
 	}
 	ops = append(ops, createOps...)
 
-	// Add port to join switch
+	// Get join switch - use WhereCache as fallback if Get fails due to cache sync
 	ls := &LogicalSwitch{Name: JoinSwitchName}
 	err = nbClient.Get(ctx, ls)
 	if err != nil {
-		return fmt.Errorf("failed to get join switch: %w", err)
+		if err == client.ErrNotFound {
+			// Try WhereCache as fallback for cache sync issues
+			var switches []*LogicalSwitch
+			err = nbClient.WhereCache(func(s *LogicalSwitch) bool {
+				return s.Name == JoinSwitchName
+			}).List(ctx, &switches)
+			if err != nil || len(switches) == 0 {
+				return fmt.Errorf("failed to get join switch: object not found (cache may not be synced yet)")
+			}
+			ls = switches[0]
+			klog.V(4).Infof("Found join switch %s via WhereCache (UUID: %s)", JoinSwitchName, ls.UUID)
+		} else {
+			return fmt.Errorf("failed to get join switch: %w", err)
+		}
 	}
 
 	mutateOps, err := nbClient.Where(ls).Mutate(ls, model.Mutation{

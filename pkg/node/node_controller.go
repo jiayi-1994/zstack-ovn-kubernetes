@@ -309,7 +309,6 @@ func intLog2(n int) int {
 	return log
 }
 
-
 // NewNodeController creates a new node controller.
 //
 // Parameters:
@@ -764,14 +763,11 @@ func (c *NodeController) ensureJoinNetwork(ctx context.Context) error {
 		return fmt.Errorf("logical router ops not initialized")
 	}
 
-	// Create join switch
-	if err := c.lrOps.EnsureJoinSwitch(ctx); err != nil {
-		return fmt.Errorf("failed to create join switch: %w", err)
-	}
-
-	// Create router port connecting to join switch
-	if err := c.lrOps.EnsureJoinRouterPort(ctx); err != nil {
-		return fmt.Errorf("failed to create join router port: %w", err)
+	// Create join switch and router port in a single transaction
+	// This avoids cache sync issues between separate transactions
+	_, err := c.lrOps.EnsureJoinSwitchAndRouterPort(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to create join network: %w", err)
 	}
 
 	c.mu.Lock()
