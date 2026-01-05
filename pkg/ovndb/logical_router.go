@@ -314,23 +314,13 @@ func (o *LogicalRouterOps) EnsureRouterPortToSwitch(
 
 	klog.V(4).Infof("Ensuring router port %s with network %s", lrpName, network)
 
-	// Create or update the Logical Router Port
-	lrp := &LogicalRouterPort{
-		Name:     lrpName,
-		MAC:      mac,
-		Networks: []string{network},
-		ExternalIDs: map[string]string{
-			"k8s.ovn.org/switch": switchName,
-		},
-	}
-
 	// Get the cluster router
 	router, err := o.GetLogicalRouter(ctx, ClusterRouterName)
 	if err != nil {
 		return fmt.Errorf("cluster router not found: %w", err)
 	}
 
-	// Check if port already exists
+	// Check if router port already exists
 	existingLRP := &LogicalRouterPort{Name: lrpName}
 	err = o.client.nbClient.Get(ctx, existingLRP)
 	if err != nil && err != client.ErrNotFound {
@@ -340,14 +330,24 @@ func (o *LogicalRouterOps) EnsureRouterPortToSwitch(
 	var ops []ovsdb.Operation
 
 	if err == client.ErrNotFound {
-		// Create new router port
+		// Create new router port with named UUID
+		lrp := &LogicalRouterPort{
+			UUID:     BuildNamedUUID(lrpName),
+			Name:     lrpName,
+			MAC:      mac,
+			Networks: []string{network},
+			ExternalIDs: map[string]string{
+				"k8s.ovn.org/switch": switchName,
+			},
+		}
+
 		createOps, err := o.client.nbClient.Create(lrp)
 		if err != nil {
 			return fmt.Errorf("failed to create router port operation: %w", err)
 		}
 		ops = append(ops, createOps...)
 
-		// Add port to router
+		// Add port to router using named UUID
 		mutateOps, err := o.client.nbClient.Where(router).Mutate(router, model.Mutation{
 			Field:   &router.Ports,
 			Mutator: ovsdb.MutateOperationInsert,
@@ -370,19 +370,7 @@ func (o *LogicalRouterOps) EnsureRouterPortToSwitch(
 		}
 	}
 
-	// Create the corresponding switch port
-	lsp := &LogicalSwitchPort{
-		Name: lspName,
-		Type: "router",
-		Options: map[string]string{
-			"router-port": lrpName,
-		},
-		Addresses: []string{"router"},
-		ExternalIDs: map[string]string{
-			"k8s.ovn.org/router-port": lrpName,
-		},
-	}
-
+	// Check if switch port already exists
 	lspOps := NewLogicalSwitchPortOps(o.client)
 	existingLSP, err := lspOps.GetLogicalSwitchPort(ctx, lspName)
 	if err != nil && !IsNotFound(err) {
@@ -390,7 +378,20 @@ func (o *LogicalRouterOps) EnsureRouterPortToSwitch(
 	}
 
 	if IsNotFound(err) || existingLSP == nil {
-		// Create switch port and add to switch
+		// Create switch port with named UUID
+		lsp := &LogicalSwitchPort{
+			UUID: BuildNamedUUID(lspName),
+			Name: lspName,
+			Type: "router",
+			Options: map[string]string{
+				"router-port": lrpName,
+			},
+			Addresses: []string{"router"},
+			ExternalIDs: map[string]string{
+				"k8s.ovn.org/router-port": lrpName,
+			},
+		}
+
 		createOps, err := o.client.nbClient.Create(lsp)
 		if err != nil {
 			return fmt.Errorf("failed to create switch port operation: %w", err)
@@ -417,7 +418,7 @@ func (o *LogicalRouterOps) EnsureRouterPortToSwitch(
 			}
 		}
 
-		// Add port to switch
+		// Add port to switch using named UUID
 		mutateOps, err := o.client.nbClient.Where(ls).Mutate(ls, model.Mutation{
 			Field:   &ls.Ports,
 			Mutator: ovsdb.MutateOperationInsert,

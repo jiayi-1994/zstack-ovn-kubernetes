@@ -299,6 +299,11 @@ func (o *LogicalSwitchOps) DeleteLogicalSwitchOps(name string) ([]ovsdb.Operatio
 // If the switch doesn't exist, it creates a new one.
 // This is an idempotent operation that handles cache sync issues.
 //
+// This function handles duplicate creation by:
+// 1. First checking the cache via Get() and WhereCache() as fallback
+// 2. Using a Wait operation as a guard to prevent duplicate creation at database level
+// 3. Handling constraint violation errors gracefully
+//
 // Parameters:
 //   - ctx: Context for cancellation
 //   - ls: Logical Switch to create or update
@@ -330,40 +335,118 @@ func (o *LogicalSwitchOps) CreateOrUpdateLogicalSwitch(ctx context.Context, ls *
 		return fmt.Errorf("failed to check existing switch: %w", err)
 	}
 
+	// Cache miss - also try WhereCache as fallback (handles cache sync delays)
+	var switches []*LogicalSwitch
+	err = nbClient.WhereCache(func(s *LogicalSwitch) bool {
+		return s.Name == ls.Name
+	}).List(ctx, &switches)
+	if err == nil && len(switches) > 0 {
+		ls.UUID = switches[0].UUID
+		klog.V(4).Infof("Logical switch %s found via WhereCache with UUID %s", ls.Name, switches[0].UUID)
+		return o.UpdateLogicalSwitch(ctx, ls)
+	}
+
 	// Switch doesn't exist, create it with a named UUID
 	ls.UUID = BuildNamedUUID(ls.Name)
 
-	ops, err := nbClient.Create(ls)
+	// Build a guard operation (Wait) to prevent duplicate creation
+	// This is the same pattern used by ovn-kubernetes
+	// See: https://bugzilla.redhat.com/show_bug.cgi?id=2042001
+	var ops []ovsdb.Operation
+
+	guardOps, err := o.buildFailOnDuplicateOps(ls)
+	if err != nil {
+		klog.V(4).Infof("Failed to build guard ops for switch %s: %v, proceeding without guard", ls.Name, err)
+	} else if len(guardOps) > 0 {
+		ops = append(ops, guardOps...)
+	}
+
+	createOps, err := nbClient.Create(ls)
 	if err != nil {
 		return fmt.Errorf("failed to create switch operation: %w", err)
 	}
+	ops = append(ops, createOps...)
 
 	results, err := nbClient.Transact(ctx, ops...)
 	if err != nil {
-		// Check if it's a duplicate error (another reconcile created it)
-		if isDuplicateSwitchError(err) {
+		// Check if it's a duplicate error (another reconcile created it) or wait timeout
+		if isDuplicateSwitchError(err) || isWaitTimeoutSwitchError(err) {
 			klog.V(4).Infof("Switch %s was created by another reconcile, this is expected", ls.Name)
+			// Try to get the existing switch's UUID
+			if existing, getErr := o.GetLogicalSwitch(ctx, ls.Name); getErr == nil {
+				ls.UUID = existing.UUID
+			}
 			return nil
 		}
 		return fmt.Errorf("failed to create switch: %w", err)
 	}
 
 	if err := checkSwitchTransactResults(results); err != nil {
-		// Check if it's a constraint violation (duplicate)
-		if isDuplicateSwitchError(err) {
+		// Check if it's a constraint violation (duplicate) or wait condition failed
+		if isDuplicateSwitchError(err) || isWaitTimeoutSwitchError(err) {
 			klog.V(4).Infof("Switch %s already exists (constraint violation), this is expected", ls.Name)
+			// Try to get the existing switch's UUID
+			if existing, getErr := o.GetLogicalSwitch(ctx, ls.Name); getErr == nil {
+				ls.UUID = existing.UUID
+			}
 			return nil
 		}
 		return fmt.Errorf("switch creation failed: %w", err)
 	}
 
 	// Set the real UUID from the transaction result
-	if len(results) > 0 && results[0].UUID.GoUUID != "" {
-		ls.UUID = results[0].UUID.GoUUID
+	// Skip the guard op result if present
+	resultIdx := 0
+	if len(guardOps) > 0 {
+		resultIdx = len(guardOps)
+	}
+	if len(results) > resultIdx && results[resultIdx].UUID.GoUUID != "" {
+		ls.UUID = results[resultIdx].UUID.GoUUID
 	}
 
 	klog.Infof("Created logical switch %s with UUID %s", ls.Name, ls.UUID)
 	return nil
+}
+
+// buildFailOnDuplicateOps builds a Wait operation that fails if a duplicate switch exists.
+// This is the same pattern used by ovn-kubernetes to prevent duplicate creation.
+// See: https://bugzilla.redhat.com/show_bug.cgi?id=2042001
+func (o *LogicalSwitchOps) buildFailOnDuplicateOps(ls *LogicalSwitch) ([]ovsdb.Operation, error) {
+	if ls.Name == "" {
+		return nil, nil
+	}
+
+	nbClient := o.client.NBClient()
+	if nbClient == nil {
+		return nil, fmt.Errorf("NB client is not connected")
+	}
+
+	timeout := 0 // 0 means check immediately, don't wait
+	cond := model.Condition{
+		Field:    &ls.Name,
+		Function: ovsdb.ConditionEqual,
+		Value:    ls.Name,
+	}
+
+	// Wait for condition: Name != ls.Name (i.e., no switch with this name exists)
+	// If a switch with this name already exists, the Wait will fail immediately
+	return nbClient.WhereAny(ls, cond).Wait(
+		ovsdb.WaitConditionNotEqual,
+		&timeout,
+		ls,
+		&ls.Name,
+	)
+}
+
+// isWaitTimeoutSwitchError checks if an error is a Wait operation timeout/condition failure
+func isWaitTimeoutSwitchError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "timed out") ||
+		strings.Contains(errStr, "wait condition") ||
+		strings.Contains(errStr, "timeout")
 }
 
 // isDuplicateSwitchError checks if an error indicates a duplicate/constraint violation
