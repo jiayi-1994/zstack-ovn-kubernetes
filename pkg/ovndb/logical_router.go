@@ -1135,8 +1135,11 @@ func (o *LogicalRouterOps) EnsureSNATForCluster(ctx context.Context, externalIP,
 		}
 	}
 
-	// Create new SNAT rule
+	// Create new SNAT rule with named UUID
+	// Use a sanitized name for the UUID (replace special chars)
+	natName := fmt.Sprintf("snat_%s_%s", sanitizeForUUID(clusterCIDR), sanitizeForUUID(externalIP))
 	nat := &NAT{
+		UUID:       BuildNamedUUID(natName),
 		Type:       NATTypeSNAT,
 		ExternalIP: externalIP,
 		LogicalIP:  clusterCIDR,
@@ -1186,6 +1189,21 @@ func generateMACFromIP(ipStr string) string {
 		return "0a:58:00:00:00:01"
 	}
 	return fmt.Sprintf("0a:58:%02x:%02x:%02x:%02x", ip4[0], ip4[1], ip4[2], ip4[3])
+}
+
+// sanitizeForUUID sanitizes a string for use in named UUIDs.
+// Replaces characters that are not alphanumeric or underscore with underscores.
+func sanitizeForUUID(s string) string {
+	result := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' {
+			result = append(result, c)
+		} else {
+			result = append(result, '_')
+		}
+	}
+	return string(result)
 }
 
 

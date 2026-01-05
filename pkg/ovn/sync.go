@@ -108,16 +108,23 @@ type SyncResult struct {
 // normal reconciliation begins.
 //
 // Steps:
-// 1. Sync cluster router and join network
-// 2. Sync nodes (clean stale node switches, recover missing)
-// 3. Sync subnets (clean stale subnet switches, recover missing)
-// 4. Sync pods (clean stale LSPs, recover IP allocations)
-// 5. Sync NAT and routing rules
+// 1. Clean up duplicate switches (from previous failed runs)
+// 2. Sync cluster router and join network
+// 3. Sync nodes (clean stale node switches, recover missing)
+// 4. Sync subnets (clean stale subnet switches, recover missing)
+// 5. Sync pods (clean stale LSPs, recover IP allocations)
+// 6. Sync NAT and routing rules
 func (s *SyncManager) RunFullSync(ctx context.Context) (*SyncResult, error) {
 	startTime := time.Now()
 	result := &SyncResult{}
 
 	klog.Info("Starting full OVN sync...")
+
+	// 0. Clean up duplicate switches first
+	if err := s.cleanupDuplicateSwitches(ctx); err != nil {
+		klog.Warningf("Failed to cleanup duplicate switches: %v", err)
+		// Don't fail, continue with sync
+	}
 
 	// 1. Ensure cluster router exists
 	if err := s.syncClusterRouter(ctx); err != nil {
@@ -190,6 +197,81 @@ type syncResult struct {
 	processed int
 	cleaned   int
 	recovered int
+}
+
+// cleanupDuplicateSwitches removes duplicate logical switches with the same name.
+// This can happen if the controller crashed during switch creation or if there
+// were race conditions. We keep only one switch per name (the one with ports).
+func (s *SyncManager) cleanupDuplicateSwitches(ctx context.Context) error {
+	if s.ovnClient == nil || !s.ovnClient.IsConnected() {
+		klog.V(4).Info("OVN client not connected, skipping duplicate switch cleanup")
+		return nil
+	}
+
+	// Get all logical switches
+	switches, err := s.lsOps.ListLogicalSwitches(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to list logical switches: %w", err)
+	}
+
+	// Group switches by name
+	switchesByName := make(map[string][]*ovndb.LogicalSwitch)
+	for _, ls := range switches {
+		switchesByName[ls.Name] = append(switchesByName[ls.Name], ls)
+	}
+
+	// Find and remove duplicates
+	cleanedCount := 0
+	for name, sws := range switchesByName {
+		if len(sws) <= 1 {
+			continue
+		}
+
+		klog.Infof("Found %d duplicate switches with name %s, cleaning up...", len(sws), name)
+
+		// Find the "best" switch to keep (one with ports, or the first one)
+		var keepSwitch *ovndb.LogicalSwitch
+		for _, sw := range sws {
+			if len(sw.Ports) > 0 {
+				keepSwitch = sw
+				break
+			}
+		}
+		if keepSwitch == nil {
+			keepSwitch = sws[0]
+		}
+
+		// Delete all other switches
+		for _, sw := range sws {
+			if sw.UUID == keepSwitch.UUID {
+				continue
+			}
+
+			klog.Infof("Deleting duplicate switch %s (UUID: %s)", sw.Name, sw.UUID)
+			
+			// Delete by UUID directly using the client
+			nbClient := s.ovnClient.NBClient()
+			if nbClient != nil {
+				deleteOps, err := nbClient.Where(sw).Delete()
+				if err != nil {
+					klog.Warningf("Failed to build delete operation for switch %s: %v", sw.UUID, err)
+					continue
+				}
+				_, err = nbClient.Transact(ctx, deleteOps...)
+				if err != nil {
+					klog.Warningf("Failed to delete duplicate switch %s: %v", sw.UUID, err)
+					continue
+				}
+				cleanedCount++
+			}
+		}
+	}
+
+	if cleanedCount > 0 {
+		klog.Infof("Cleaned up %d duplicate switches", cleanedCount)
+	}
+
+	return nil
 }
 
 // syncClusterRouter ensures the cluster router and join network exist.
