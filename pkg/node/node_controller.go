@@ -668,7 +668,8 @@ func (c *NodeController) GetNodeSubnet(nodeName string) string {
 }
 
 // SyncExistingNodes synchronizes existing nodes on controller startup.
-// This recovers the subnet allocation state from node annotations.
+// This recovers the subnet allocation state from node annotations and
+// cleans up stale OVN resources for nodes that no longer exist.
 //
 // Parameters:
 //   - ctx: Context for cancellation
@@ -683,7 +684,11 @@ func (c *NodeController) SyncExistingNodes(ctx context.Context) error {
 		return fmt.Errorf("failed to list nodes: %w", err)
 	}
 
+	// Build set of valid node names
+	validNodes := make(map[string]bool)
 	for _, node := range nodeList.Items {
+		validNodes[node.Name] = true
+
 		subnetCIDR := node.Annotations[NodeSubnetAnnotation]
 		if subnetCIDR == "" {
 			continue
@@ -708,7 +713,84 @@ func (c *NodeController) SyncExistingNodes(ctx context.Context) error {
 		klog.V(4).Infof("Recovered subnet %s for node %s", subnetCIDR, node.Name)
 	}
 
+	// Clean up stale OVN resources for nodes that no longer exist
+	if err := c.cleanupStaleNodeResources(ctx, validNodes); err != nil {
+		klog.Warningf("Failed to cleanup stale node resources: %v", err)
+		// Don't fail the sync, continue with normal operation
+	}
+
 	klog.Infof("Synced %d existing nodes", len(nodeList.Items))
+	return nil
+}
+
+// cleanupStaleNodeResources cleans up OVN resources for nodes that no longer exist.
+func (c *NodeController) cleanupStaleNodeResources(ctx context.Context, validNodes map[string]bool) error {
+	if c.ovnClient == nil || !c.ovnClient.IsConnected() {
+		klog.V(4).Info("OVN client not connected, skipping stale resource cleanup")
+		return nil
+	}
+
+	lsOps := ovndb.NewLogicalSwitchOps(c.ovnClient)
+
+	// Get all logical switches from OVN
+	switches, err := lsOps.ListLogicalSwitches(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to list logical switches: %w", err)
+	}
+
+	// Find and clean up stale node switches
+	cleanedCount := 0
+	for _, ls := range switches {
+		// Check if this is a node switch (format: node-<nodeName>)
+		if len(ls.Name) <= 5 || ls.Name[:5] != "node-" {
+			continue
+		}
+
+		nodeName := ls.Name[5:] // Remove "node-" prefix
+		if nodeName == "" {
+			continue
+		}
+
+		// Check if node still exists
+		if validNodes[nodeName] {
+			continue
+		}
+
+		klog.Infof("Cleaning up stale node switch: %s (node %s no longer exists)", ls.Name, nodeName)
+
+		// Delete router port connecting to this switch
+		if c.lrOps != nil {
+			if err := c.lrOps.DeleteRouterPort(ctx, ls.Name); err != nil {
+				if !ovndb.IsNotFound(err) {
+					klog.Warningf("Failed to delete router port for node %s: %v", nodeName, err)
+				}
+			}
+		}
+
+		// Delete the node's logical switch
+		if err := lsOps.DeleteLogicalSwitch(ctx, ls.Name); err != nil {
+			if !ovndb.IsNotFound(err) {
+				klog.Warningf("Failed to delete logical switch %s: %v", ls.Name, err)
+				continue
+			}
+		}
+
+		// Delete external switch if exists
+		extSwitchName := ovndb.GetExternalSwitchName(nodeName)
+		if err := lsOps.DeleteLogicalSwitch(ctx, extSwitchName); err != nil {
+			if !ovndb.IsNotFound(err) {
+				klog.V(4).Infof("Failed to delete external switch %s: %v", extSwitchName, err)
+			}
+		}
+
+		cleanedCount++
+		klog.Infof("Cleaned up OVN resources for stale node %s", nodeName)
+	}
+
+	if cleanedCount > 0 {
+		klog.Infof("Cleaned up %d stale node resources", cleanedCount)
+	}
+
 	return nil
 }
 
