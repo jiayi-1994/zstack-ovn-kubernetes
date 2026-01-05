@@ -28,7 +28,6 @@ import (
 	"fmt"
 	"net"
 	"strings"
-	"time"
 
 	"github.com/ovn-org/libovsdb/client"
 	"github.com/ovn-org/libovsdb/model"
@@ -78,18 +77,22 @@ func NewLogicalRouterOps(c *Client) *LogicalRouterOps {
 // It enables Pod-to-Pod communication across nodes and provides the gateway
 // for external traffic.
 func (o *LogicalRouterOps) CreateClusterRouter(ctx context.Context) (*LogicalRouter, error) {
-	// Check if router already exists
-	existing, err := o.GetLogicalRouter(ctx, ClusterRouterName)
-	if err == nil {
-		klog.V(4).Infof("Cluster router %s already exists", ClusterRouterName)
-		return existing, nil
-	}
-	if !IsNotFound(err) {
+	// Check if router already exists using WhereCache (more reliable than Get for cache lookups)
+	var existing []*LogicalRouter
+	err := o.client.nbClient.WhereCache(func(lr *LogicalRouter) bool {
+		return lr.Name == ClusterRouterName
+	}).List(ctx, &existing)
+	if err != nil {
 		return nil, fmt.Errorf("failed to check existing router: %w", err)
 	}
+	if len(existing) > 0 {
+		klog.V(4).Infof("Cluster router %s already exists", ClusterRouterName)
+		return existing[0], nil
+	}
 
-	// Create the router
+	// Create the router with a named UUID
 	router := &LogicalRouter{
+		UUID: BuildNamedUUID(ClusterRouterName),
 		Name: ClusterRouterName,
 		ExternalIDs: map[string]string{
 			"k8s.ovn.org/kind":  "cluster-router",
@@ -114,35 +117,13 @@ func (o *LogicalRouterOps) CreateClusterRouter(ctx context.Context) (*LogicalRou
 		return nil, fmt.Errorf("cluster router creation failed: %w", err)
 	}
 
-	klog.Infof("Created cluster router %s", ClusterRouterName)
-
-	// Fetch and return the created router with retry
-	// libovsdb cache may not be updated immediately after transaction
-	return o.getLogicalRouterWithRetry(ctx, ClusterRouterName, 5)
-}
-
-// getLogicalRouterWithRetry retrieves a logical router with retry logic.
-// This is needed because libovsdb cache may not be updated immediately after a transaction.
-func (o *LogicalRouterOps) getLogicalRouterWithRetry(ctx context.Context, name string, maxRetries int) (*LogicalRouter, error) {
-	var lastErr error
-	for i := 0; i < maxRetries; i++ {
-		router, err := o.GetLogicalRouter(ctx, name)
-		if err == nil {
-			return router, nil
-		}
-		lastErr = err
-		if !IsNotFound(err) {
-			return nil, err
-		}
-		// Wait a bit for cache to sync
-		klog.V(4).Infof("Waiting for cache sync, retry %d/%d for router %s", i+1, maxRetries, name)
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-timeAfter(100 * time.Millisecond):
-		}
+	// Set the real UUID from the transaction result (ovn-kubernetes pattern)
+	if len(results) > 0 && results[0].UUID.GoUUID != "" {
+		router.UUID = results[0].UUID.GoUUID
 	}
-	return nil, fmt.Errorf("router %s not found after %d retries: %w", name, maxRetries, lastErr)
+
+	klog.Infof("Created cluster router %s with UUID %s", ClusterRouterName, router.UUID)
+	return router, nil
 }
 
 // GetLogicalRouter retrieves a logical router by name.
@@ -481,9 +462,6 @@ func checkTransactResults(results []ovsdb.OperationResult) error {
 	}
 	return nil
 }
-
-// timeAfter is a wrapper for time.After to allow for testing.
-var timeAfter = time.After
 
 // EnsureJoinSwitch creates the join switch that connects the cluster router to gateway chassis.
 // The join switch acts as a transit network between the cluster router and external networks.
