@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"time"
 
 	"github.com/ovn-org/libovsdb/client"
 	"github.com/ovn-org/libovsdb/model"
@@ -115,8 +116,33 @@ func (o *LogicalRouterOps) CreateClusterRouter(ctx context.Context) (*LogicalRou
 
 	klog.Infof("Created cluster router %s", ClusterRouterName)
 
-	// Fetch and return the created router
-	return o.GetLogicalRouter(ctx, ClusterRouterName)
+	// Fetch and return the created router with retry
+	// libovsdb cache may not be updated immediately after transaction
+	return o.getLogicalRouterWithRetry(ctx, ClusterRouterName, 5)
+}
+
+// getLogicalRouterWithRetry retrieves a logical router with retry logic.
+// This is needed because libovsdb cache may not be updated immediately after a transaction.
+func (o *LogicalRouterOps) getLogicalRouterWithRetry(ctx context.Context, name string, maxRetries int) (*LogicalRouter, error) {
+	var lastErr error
+	for i := 0; i < maxRetries; i++ {
+		router, err := o.GetLogicalRouter(ctx, name)
+		if err == nil {
+			return router, nil
+		}
+		lastErr = err
+		if !IsNotFound(err) {
+			return nil, err
+		}
+		// Wait a bit for cache to sync
+		klog.V(4).Infof("Waiting for cache sync, retry %d/%d for router %s", i+1, maxRetries, name)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-timeAfter(100 * time.Millisecond):
+		}
+	}
+	return nil, fmt.Errorf("router %s not found after %d retries: %w", name, maxRetries, lastErr)
 }
 
 // GetLogicalRouter retrieves a logical router by name.
@@ -455,6 +481,9 @@ func checkTransactResults(results []ovsdb.OperationResult) error {
 	}
 	return nil
 }
+
+// timeAfter is a wrapper for time.After to allow for testing.
+var timeAfter = time.After
 
 // EnsureJoinSwitch creates the join switch that connects the cluster router to gateway chassis.
 // The join switch acts as a transit network between the cluster router and external networks.
