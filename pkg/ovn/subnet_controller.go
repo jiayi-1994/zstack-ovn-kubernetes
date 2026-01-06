@@ -136,6 +136,19 @@ func (r *SubnetReconciler) reconcileSubnet(ctx context.Context, subnet *networkv
 	lsName := subnet.GetLogicalSwitchName()
 	log.V(4).Info("Processing Logical Switch", "name", lsName)
 
+	// IMPORTANT: Check if cluster router exists BEFORE creating the switch
+	// This prevents creating orphan switches that can't be connected to the router
+	if r.lrOps != nil {
+		_, err := r.lrOps.GetLogicalRouter(ctx, ovndb.ClusterRouterName)
+		if err != nil {
+			if ovndb.IsNotFound(err) {
+				log.Info("Cluster router not found yet, waiting for node controller to create it")
+				return ctrl.Result{Requeue: true}, nil
+			}
+			return ctrl.Result{}, fmt.Errorf("failed to check cluster router: %w", err)
+		}
+	}
+
 	if subnet.IsExternalMode() {
 		if err := r.verifyExternalLogicalSwitch(ctx, subnet, lsName); err != nil {
 			return ctrl.Result{}, err
@@ -260,45 +273,19 @@ func (r *SubnetReconciler) ensureLogicalSwitch(ctx context.Context, subnet *netw
 		return nil
 	}
 
-	// In standalone mode, use direct creation (no conflict checking needed)
-	existingLS, err := r.lsOps.GetLogicalSwitch(ctx, lsName)
-	if err != nil && !ovndb.IsNotFound(err) {
-		return fmt.Errorf("failed to check existing Logical Switch: %w", err)
+	// In standalone mode, use CreateOrUpdateLogicalSwitch for idempotent operation
+	// This handles cache sync issues and prevents duplicate creation
+	ls := &ovndb.LogicalSwitch{
+		Name:        lsName,
+		OtherConfig: otherConfig,
+		ExternalIDs: externalIDs,
 	}
 
-	if existingLS != nil {
-		log.V(4).Info("Logical Switch already exists, checking for updates")
-
-		if existingLS.ExternalIDs[ExternalIDManagedBy] != ExternalIDManagedByValue {
-			return fmt.Errorf("Logical Switch %s exists but is not managed by zstack-ovn-kubernetes", lsName)
-		}
-
-		needsUpdate := false
-		if !mapsEqual(existingLS.OtherConfig, otherConfig) {
-			existingLS.OtherConfig = otherConfig
-			needsUpdate = true
-		}
-		if !mapsEqual(existingLS.ExternalIDs, externalIDs) {
-			existingLS.ExternalIDs = externalIDs
-			needsUpdate = true
-		}
-
-		if needsUpdate {
-			log.V(4).Info("Updating Logical Switch configuration")
-			if err := r.lsOps.UpdateLogicalSwitch(ctx, existingLS); err != nil {
-				return fmt.Errorf("failed to update Logical Switch: %w", err)
-			}
-		}
-
-		return nil
+	if err := r.lsOps.CreateOrUpdateLogicalSwitch(ctx, ls); err != nil {
+		return fmt.Errorf("failed to create/update Logical Switch: %w", err)
 	}
 
-	log.Info("Creating new Logical Switch", "name", lsName)
-	_, err = r.lsOps.CreateLogicalSwitch(ctx, lsName, otherConfig, externalIDs)
-	if err != nil {
-		return fmt.Errorf("failed to create Logical Switch: %w", err)
-	}
-
+	log.Info("Logical Switch ensured", "name", lsName, "uuid", ls.UUID)
 	r.recorder.Event(subnet, "Normal", "LogicalSwitchCreated",
 		fmt.Sprintf("Created OVN Logical Switch %s", lsName))
 

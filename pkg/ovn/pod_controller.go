@@ -180,10 +180,13 @@ func (r *PodReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		return result, err
 	}
 
-	log.Info("Pod network configured successfully")
-	r.recorder.Event(pod, corev1.EventTypeNormal, "NetworkConfigured", "Pod network configured successfully")
+	// Only log success if we actually configured the network (not just requeued)
+	if !result.Requeue {
+		log.Info("Pod network configured successfully")
+		r.recorder.Event(pod, corev1.EventTypeNormal, "NetworkConfigured", "Pod network configured successfully")
+	}
 
-	return ctrl.Result{}, nil
+	return result, nil
 }
 
 // shouldManagePod determines if a Pod should be managed by this controller.
@@ -237,7 +240,8 @@ func (r *PodReconciler) configurePodNetwork(ctx context.Context, pod *corev1.Pod
 	// Get the IP allocator for this subnet
 	alloc := r.subnetReconciler.GetAllocator(subnet.Name)
 	if alloc == nil {
-		return ctrl.Result{Requeue: true}, fmt.Errorf("IP allocator not ready for subnet %s", subnet.Name)
+		log.Info("IP allocator not ready for subnet, waiting", "subnet", subnet.Name)
+		return ctrl.Result{Requeue: true}, nil
 	}
 
 	// Allocate IP address

@@ -1,66 +1,81 @@
 #!/bin/bash
-# Script to cleanup duplicate logical switches in OVN
-# Run this on a node with access to ovn-nbctl
+# Cleanup duplicate logical switches in OVN
+# This script removes duplicate switches with the same name, keeping only one
 
 set -e
 
-echo "=== Cleaning up duplicate OVN Logical Switches ==="
+# Get OVN NB pod
+OVN_NB_POD=$(kubectl -n zstack-ovn-kubernetes get pods -l app=ovn-nb-db -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
 
-# Get all switch names and their UUIDs
+if [ -z "$OVN_NB_POD" ]; then
+    echo "Error: OVN NB DB pod not found"
+    exit 1
+fi
+
+echo "Using OVN NB pod: $OVN_NB_POD"
+
+# Function to run ovn-nbctl command
+ovn_nbctl() {
+    kubectl -n zstack-ovn-kubernetes exec -i "$OVN_NB_POD" -- ovn-nbctl "$@"
+}
+
+# Get all switches with their UUIDs
 echo "Listing all logical switches..."
-ovn-nbctl --format=table --no-headings --columns=_uuid,name list Logical_Switch > /tmp/switches.txt
+SWITCHES=$(ovn_nbctl --format=table --no-headings --columns=_uuid,name find Logical_Switch)
 
-# Find duplicates
-echo "Finding duplicates..."
-declare -A switch_uuids
-declare -A switch_counts
-
-while read -r uuid name; do
-    if [[ -n "$name" ]]; then
-        switch_counts[$name]=$((${switch_counts[$name]:-0} + 1))
-        switch_uuids[$name]="${switch_uuids[$name]} $uuid"
+# Group switches by name
+declare -A SWITCH_GROUPS
+while IFS= read -r line; do
+    if [ -z "$line" ]; then continue; fi
+    UUID=$(echo "$line" | awk '{print $1}')
+    NAME=$(echo "$line" | awk '{print $2}')
+    if [ -n "$NAME" ]; then
+        SWITCH_GROUPS["$NAME"]="${SWITCH_GROUPS[$NAME]} $UUID"
     fi
-done < /tmp/switches.txt
+done <<< "$SWITCHES"
 
-# Process duplicates
-for name in "${!switch_counts[@]}"; do
-    count=${switch_counts[$name]}
-    if [[ $count -gt 1 ]]; then
+# Find and remove duplicates
+CLEANED=0
+for NAME in "${!SWITCH_GROUPS[@]}"; do
+    UUIDS=(${SWITCH_GROUPS[$NAME]})
+    COUNT=${#UUIDS[@]}
+    
+    if [ $COUNT -gt 1 ]; then
         echo ""
-        echo "Found $count switches with name: $name"
+        echo "Found $COUNT duplicate switches named '$NAME'"
         
-        # Get UUIDs for this name
-        uuids=(${switch_uuids[$name]})
-        
-        # Find which one has ports (we'll keep that one)
-        keep_uuid=""
-        for uuid in "${uuids[@]}"; do
-            ports=$(ovn-nbctl --format=table --no-headings get Logical_Switch $uuid ports 2>/dev/null || echo "[]")
-            if [[ "$ports" != "[]" && -n "$ports" ]]; then
-                keep_uuid=$uuid
-                echo "  Keeping $uuid (has ports)"
+        # Find the best switch to keep (one with ports)
+        KEEP_UUID=""
+        for UUID in "${UUIDS[@]}"; do
+            PORTS=$(ovn_nbctl --format=table --no-headings get Logical_Switch "$UUID" ports 2>/dev/null || echo "")
+            if [ -n "$PORTS" ] && [ "$PORTS" != "[]" ]; then
+                KEEP_UUID="$UUID"
+                echo "  Keeping $UUID (has ports)"
                 break
             fi
         done
         
-        # If none have ports, keep the first one
-        if [[ -z "$keep_uuid" ]]; then
-            keep_uuid=${uuids[0]}
-            echo "  Keeping $keep_uuid (first one, no ports)"
+        # If no switch has ports, keep the first one
+        if [ -z "$KEEP_UUID" ]; then
+            KEEP_UUID="${UUIDS[0]}"
+            echo "  Keeping $KEEP_UUID (first one, no ports found)"
         fi
         
-        # Delete the others
-        for uuid in "${uuids[@]}"; do
-            if [[ "$uuid" != "$keep_uuid" ]]; then
-                echo "  Deleting duplicate: $uuid"
-                ovn-nbctl ls-del $uuid 2>/dev/null || echo "    Failed to delete $uuid (may have references)"
+        # Delete all other switches
+        for UUID in "${UUIDS[@]}"; do
+            if [ "$UUID" != "$KEEP_UUID" ]; then
+                echo "  Deleting duplicate: $UUID"
+                ovn_nbctl ls-del "$UUID" 2>/dev/null || echo "    Warning: Failed to delete $UUID"
+                ((CLEANED++)) || true
             fi
         done
     fi
 done
 
 echo ""
-echo "=== Cleanup complete ==="
+echo "Cleanup complete. Removed $CLEANED duplicate switches."
+
+# Show final state
 echo ""
-echo "Current switches:"
-ovn-nbctl ls-list
+echo "Current logical switches:"
+ovn_nbctl show | grep -E "^switch|port"

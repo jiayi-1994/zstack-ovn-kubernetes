@@ -1,5 +1,6 @@
 # Default Subnet for Pod networking
 # This creates a default subnet using the cluster CIDR from values.yaml
+# Uses post-install hook to ensure CRD is registered before creating CR
 {{- if .Values.network.createDefaultSubnet | default true }}
 ---
 apiVersion: network.zstack.io/v1
@@ -9,6 +10,13 @@ metadata:
   labels:
     {{- include "zstack-ovn-kubernetes.labels" . | nindent 4 }}
     network-type: overlay
+  annotations:
+    # Hook to run after all other resources are installed
+    "helm.sh/hook": post-install,post-upgrade
+    # Weight determines order among hooks (lower runs first)
+    "helm.sh/hook-weight": "10"
+    # Keep the resource after hook completes
+    "helm.sh/hook-delete-policy": before-hook-creation
 spec:
   # Pod network CIDR from values.yaml
   cidr: {{ .Values.network.clusterCIDR | quote }}
@@ -22,4 +30,7 @@ spec:
   
   # IP protocol version
   protocol: IPv4
+  
+  # Mark as default subnet for Pods without explicit subnet annotation
+  default: true
 {{- end }}
