@@ -226,37 +226,70 @@ func EnsureBridgeMapping(physicalNetwork, bridgeName string) error {
 		klog.V(4).Infof("No existing bridge mappings found: %v", err)
 	}
 
-	currentMappings := strings.TrimSpace(strings.Trim(string(output), "\""))
+	// Clean up the output - remove quotes and whitespace
+	currentMappings := strings.TrimSpace(string(output))
+	currentMappings = strings.Trim(currentMappings, "\"")
+	// Also remove any escaped quotes that might be in the string
+	currentMappings = strings.ReplaceAll(currentMappings, "\\\"", "")
+	currentMappings = strings.ReplaceAll(currentMappings, "\"", "")
+
 	newMapping := fmt.Sprintf("%s:%s", physicalNetwork, bridgeName)
 
-	// Check if mapping already exists
-	if strings.Contains(currentMappings, newMapping) {
-		klog.V(4).Infof("Bridge mapping %s already exists", newMapping)
+	// Build new mappings string, filtering out invalid entries
+	var validMappings []string
+	if currentMappings != "" {
+		parts := strings.Split(currentMappings, ",")
+		for _, part := range parts {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+
+			// Validate mapping format: should be "network:bridge"
+			colonIdx := strings.Index(part, ":")
+			if colonIdx <= 0 || colonIdx >= len(part)-1 {
+				klog.Warningf("Skipping invalid bridge mapping: %q", part)
+				continue
+			}
+
+			network := part[:colonIdx]
+			bridge := part[colonIdx+1:]
+
+			// Skip if bridge name contains invalid characters (like quotes)
+			if strings.ContainsAny(bridge, "\"'\\") {
+				klog.Warningf("Skipping bridge mapping with invalid bridge name: %q", part)
+				continue
+			}
+
+			// Skip if this is the same physical network we're configuring
+			if network == physicalNetwork {
+				continue
+			}
+
+			// Verify the bridge exists before keeping the mapping
+			if err := exec.Command("ovs-vsctl", "--timeout=5", "br-exists", bridge).Run(); err != nil {
+				klog.Warningf("Skipping bridge mapping for non-existent bridge: %q", part)
+				continue
+			}
+
+			validMappings = append(validMappings, part)
+		}
+	}
+
+	// Add our new mapping
+	validMappings = append(validMappings, newMapping)
+
+	// Build final mappings string
+	mappings := strings.Join(validMappings, ",")
+
+	// Check if we need to update
+	if currentMappings == mappings {
+		klog.V(4).Infof("Bridge mapping %s already correctly configured", newMapping)
 		return nil
 	}
 
-	// Build new mappings string
-	var mappings string
-	if currentMappings != "" {
-		// Check if this physical network already has a different mapping
-		parts := strings.Split(currentMappings, ",")
-		var filtered []string
-		for _, part := range parts {
-			if !strings.HasPrefix(part, physicalNetwork+":") {
-				filtered = append(filtered, part)
-			}
-		}
-		if len(filtered) > 0 {
-			mappings = strings.Join(filtered, ",") + "," + newMapping
-		} else {
-			mappings = newMapping
-		}
-	} else {
-		mappings = newMapping
-	}
-
 	// Set the bridge mapping
-	klog.Infof("Setting OVN bridge mapping: %s", mappings)
+	klog.Infof("Setting OVN bridge mapping: %s (was: %s)", mappings, currentMappings)
 	if err := exec.Command("ovs-vsctl", "--timeout=15", "set", "Open_vSwitch", ".",
 		fmt.Sprintf("external_ids:ovn-bridge-mappings=%s", mappings)).Run(); err != nil {
 		return fmt.Errorf("failed to set bridge mapping: %w", err)

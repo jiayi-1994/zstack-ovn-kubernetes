@@ -232,9 +232,14 @@ func (g *GatewayController) configureLocalGateway() error {
 		return fmt.Errorf("failed to ensure external bridge: %w", err)
 	}
 
-	// Configure OVS external_ids for local gateway
-	if err := g.ovsVsctl("set", "Open_vSwitch", ".",
-		"external_ids:ovn-bridge-mappings=physnet1:"+types.BrEx); err != nil {
+	// Configure OVS bridge mappings using the improved function
+	// This cleans up any invalid mappings and sets the correct one
+	physicalNetwork := g.globalConfig.Gateway.Interface
+	if physicalNetwork == "" {
+		physicalNetwork = "external" // Default physical network name used by our localnet ports
+	}
+
+	if err := EnsureBridgeMapping(physicalNetwork, types.BrEx); err != nil {
 		return fmt.Errorf("failed to set bridge mappings: %w", err)
 	}
 
@@ -262,9 +267,14 @@ func (g *GatewayController) configureSharedGateway() error {
 		return fmt.Errorf("failed to ensure external bridge: %w", err)
 	}
 
-	// Configure OVS external_ids for shared gateway
-	if err := g.ovsVsctl("set", "Open_vSwitch", ".",
-		"external_ids:ovn-bridge-mappings=physnet1:"+types.BrEx); err != nil {
+	// Configure OVS bridge mappings using the improved function
+	// This cleans up any invalid mappings and sets the correct one
+	physicalNetwork := g.globalConfig.Gateway.Interface
+	if physicalNetwork == "" {
+		physicalNetwork = "external" // Default physical network name used by our localnet ports
+	}
+
+	if err := EnsureBridgeMapping(physicalNetwork, types.BrEx); err != nil {
 		return fmt.Errorf("failed to set bridge mappings: %w", err)
 	}
 
@@ -471,7 +481,6 @@ func (g *GatewayController) ovsVsctl(args ...string) error {
 	}
 	return nil
 }
-
 
 // GetNodeIP returns the node's external IP address.
 func (g *GatewayController) GetNodeIP() net.IP {
