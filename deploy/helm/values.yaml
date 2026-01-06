@@ -94,11 +94,20 @@ network:
   # Subnet size for each node (e.g., 24 means /24 subnet per node)
   nodeSubnetSize: 24
 
-  # Create default subnet automatically
-  # Set to false if you want to manage subnets manually
-  createDefaultSubnet: true
+  # Per-node subnet mode (ovn-kubernetes compatible)
+  # When true: Each node gets its own subnet (e.g., /24) from clusterCIDR
+  #   - Node1: 10.244.0.0/24, Node2: 10.244.1.0/24, etc.
+  #   - Node Controller creates per-node logical switches
+  # When false: Use Subnet CRD mode
+  #   - Single subnet covers all nodes (e.g., 10.244.0.0/16)
+  #   - Subnets are managed via Subnet CRD
+  perNodeSubnet: true
 
-  # Name of the default subnet
+  # Create default subnet automatically (only used when perNodeSubnet=false)
+  # Set to false if you want to manage subnets manually via Subnet CRD
+  createDefaultSubnet: false
+
+  # Name of the default subnet (only used when createDefaultSubnet=true)
   defaultSubnetName: "default"
 
 # Gateway Configuration

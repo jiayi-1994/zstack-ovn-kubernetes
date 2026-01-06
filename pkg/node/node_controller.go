@@ -24,6 +24,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
@@ -32,6 +33,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	networkv1 "github.com/jiayi-1994/zstack-ovn-kubernetes/api/v1"
 	"github.com/jiayi-1994/zstack-ovn-kubernetes/pkg/allocator"
 	"github.com/jiayi-1994/zstack-ovn-kubernetes/pkg/config"
 	"github.com/jiayi-1994/zstack-ovn-kubernetes/pkg/ovndb"
@@ -451,15 +453,19 @@ func (c *NodeController) handleNodeDelete(ctx context.Context, nodeName string) 
 
 // handleNodeCreateOrUpdate handles node creation or update.
 //
-// Steps:
+// In per-node subnet mode (default, ovn-kubernetes compatible):
 // 1. Ensure cluster router exists
 // 2. Ensure join network exists (for distributed gateway)
-// 3. Check if node already has a subnet annotation
-// 4. If not, allocate a new subnet
-// 5. Create or update the node's Logical Switch in OVN
-// 6. Create Router Port connecting switch to cluster router
-// 7. Configure distributed gateway for external access
-// 8. Update node annotations
+// 3. Allocate per-node subnet from cluster CIDR
+// 4. Create per-node logical switch
+// 5. Create router port connecting switch to cluster router
+// 6. Configure distributed gateway for external access
+// 7. Update node annotations
+//
+// In Subnet CRD mode (perNodeSubnet=false):
+// - Skip per-node subnet allocation and switch creation
+// - Only handle cluster router, join network, and gateway configuration
+// - Subnets are managed via Subnet CRD controller
 func (c *NodeController) handleNodeCreateOrUpdate(ctx context.Context, node *corev1.Node) (ctrl.Result, error) {
 	klog.V(4).Infof("Handling create/update of Node %s", node.Name)
 
@@ -474,6 +480,38 @@ func (c *NodeController) handleNodeCreateOrUpdate(ctx context.Context, node *cor
 		klog.Errorf("Failed to ensure join network: %v", err)
 		return ctrl.Result{}, err
 	}
+
+	// Check subnet mode - default to per-node subnet (ovn-kubernetes compatible)
+	perNodeSubnet := true
+	if c.config != nil {
+		perNodeSubnet = c.config.Network.PerNodeSubnet
+	}
+
+	if perNodeSubnet {
+		// Per-node subnet mode (default, ovn-kubernetes compatible)
+		return c.handleNodeWithPerNodeSubnet(ctx, node)
+	}
+
+	// Subnet CRD mode - skip per-node subnet allocation
+	// The Subnet CRD controller (subnet_controller.go) manages subnets and creates
+	// the logical switch (e.g., "subnet-default") with the correct CIDR.
+
+	// Configure distributed gateway for this node (external network access)
+	if err := c.ensureDistributedGateway(ctx, node); err != nil {
+		klog.Errorf("Failed to ensure distributed gateway for node %s: %v", node.Name, err)
+		// Don't fail the reconciliation for gateway errors
+		klog.Warningf("Distributed gateway configuration failed, external access may not work: %v", err)
+	}
+
+	klog.Infof("Successfully reconciled node %s (Subnet CRD mode)", node.Name)
+	return ctrl.Result{}, nil
+}
+
+// handleNodeWithPerNodeSubnet handles node with per-node subnet allocation.
+// This is the default mode, compatible with ovn-kubernetes per-node subnet architecture.
+// Each node gets its own /24 (or configured size) subnet from the cluster CIDR.
+func (c *NodeController) handleNodeWithPerNodeSubnet(ctx context.Context, node *corev1.Node) (ctrl.Result, error) {
+	klog.V(4).Infof("Handling node %s with per-node subnet mode", node.Name)
 
 	// Check if node already has a subnet
 	existingSubnet := node.Annotations[NodeSubnetAnnotation]
@@ -523,6 +561,15 @@ func (c *NodeController) handleNodeCreateOrUpdate(ctx context.Context, node *cor
 		return ctrl.Result{}, err
 	}
 
+	// Create or update Subnet CRD for this node
+	// This allows Pod Controller to find the subnet and allocate IPs
+	if err := c.ensureNodeSubnetCRD(ctx, node, subnet, gatewayIP); err != nil {
+		klog.Errorf("Failed to ensure Subnet CRD for node %s: %v", node.Name, err)
+		c.recorder.Eventf(node, corev1.EventTypeWarning, "SubnetCRDFailed",
+			"Failed to create/update Subnet CRD: %v", err)
+		return ctrl.Result{}, err
+	}
+
 	// Create Router Port connecting switch to cluster router
 	if err := c.ensureRouterPort(ctx, node, subnet, gatewayIP); err != nil {
 		klog.Errorf("Failed to ensure Router Port for node %s: %v", node.Name, err)
@@ -544,7 +591,7 @@ func (c *NodeController) handleNodeCreateOrUpdate(ctx context.Context, node *cor
 		return ctrl.Result{}, err
 	}
 
-	klog.Infof("Successfully reconciled node %s with subnet %s", node.Name, subnet.String())
+	klog.Infof("Successfully reconciled node %s with subnet %s (per-node subnet mode)", node.Name, subnet.String())
 	return ctrl.Result{}, nil
 }
 

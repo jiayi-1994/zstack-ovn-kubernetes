@@ -131,7 +131,19 @@ type NetworkConfig struct {
 	// NodeSubnetSize is the subnet prefix length for each node
 	// Example: 24 means each node gets a /24 subnet
 	// Default: 24
+	// Note: Only used when PerNodeSubnet is true
 	NodeSubnetSize int `json:"nodeSubnetSize" yaml:"nodeSubnetSize"`
+
+	// PerNodeSubnet enables per-node subnet allocation mode.
+	// When true (default, ovn-kubernetes compatible): Each node gets its own subnet
+	//   (e.g., /24) from ClusterCIDR, and a per-node logical switch is created (node-<nodeName>).
+	// When false (Subnet CRD mode): Subnets are managed via Subnet CRD,
+	//   and the Node Controller only handles gateway configuration.
+	//
+	// WARNING: Do not disable this if not using Subnet CRD, as pods won't have
+	// a logical switch to connect to.
+	// Default: true
+	PerNodeSubnet bool `json:"perNodeSubnet" yaml:"perNodeSubnet"`
 
 	// MTU is the MTU for Pod interfaces
 	// Default: 1400 (accounting for VXLAN overhead)

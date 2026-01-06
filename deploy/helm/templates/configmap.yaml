@@ -45,6 +45,7 @@ data:
       clusterCIDR: {{ .Values.network.clusterCIDR | quote }}
       serviceCIDR: {{ .Values.network.serviceCIDR | quote }}
       nodeSubnetSize: {{ .Values.network.nodeSubnetSize }}
+      perNodeSubnet: {{ .Values.network.perNodeSubnet | default true }}
 
     # Gateway Configuration
     gateway:

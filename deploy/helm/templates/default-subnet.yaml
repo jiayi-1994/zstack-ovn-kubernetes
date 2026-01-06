@@ -1,7 +1,8 @@
 # Default Subnet for Pod networking
 # This creates a default subnet using the cluster CIDR from values.yaml
+# Only used when perNodeSubnet=false (Subnet CRD mode)
 # Uses post-install hook to ensure CRD is registered before creating CR
-{{- if .Values.network.createDefaultSubnet | default true }}
+{{- if and (not .Values.network.perNodeSubnet) (.Values.network.createDefaultSubnet | default false) }}
 ---
 apiVersion: network.zstack.io/v1
 kind: Subnet
