@@ -46,6 +46,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -452,6 +453,7 @@ func createOVNClient(ctx context.Context, cfg *config.Config) (*ovndb.Client, er
 // 1. Ensures br-int (integration bridge) exists
 // 2. Sets OVS external_ids for OVN integration
 // 3. Configures system-id for chassis identification
+// 4. Cleans up invalid bridge mappings
 //
 // Parameters:
 //   - ctx: Context for cancellation
@@ -486,6 +488,12 @@ func configureOVS(ctx context.Context, cfg *config.Config, nodeName string) erro
 		return fmt.Errorf("failed to set ovn-bridge: %w", err)
 	}
 
+	// Clean up and configure bridge mappings early
+	// This ensures ovn-controller sees correct mappings from the start
+	if err := cleanupAndConfigureBridgeMappings(cfg); err != nil {
+		klog.Warningf("Failed to configure bridge mappings: %v", err)
+	}
+
 	// Configure OVN remote (Southbound DB address) for ovn-controller
 	if cfg.IsExternalMode() {
 		sbAddr := cfg.GetSBDBAddress()
@@ -497,6 +505,101 @@ func configureOVS(ctx context.Context, cfg *config.Config, nodeName string) erro
 	}
 
 	klog.Infof("OVS configured successfully on node %s", nodeName)
+	return nil
+}
+
+// cleanupAndConfigureBridgeMappings cleans up invalid bridge mappings and sets the correct one.
+// This is called early during startup to ensure ovn-controller sees correct mappings.
+func cleanupAndConfigureBridgeMappings(cfg *config.Config) error {
+	// Get current bridge mappings
+	output, err := exec.Command("ovs-vsctl", "--timeout=5", "--if-exists", "get",
+		"Open_vSwitch", ".", "external_ids:ovn-bridge-mappings").Output()
+	if err != nil {
+		klog.V(4).Infof("No existing bridge mappings found: %v", err)
+	}
+
+	// Clean up the output - remove quotes and whitespace
+	currentMappings := strings.TrimSpace(string(output))
+	currentMappings = strings.Trim(currentMappings, "\"")
+	// Remove any escaped quotes or stray quotes
+	currentMappings = strings.ReplaceAll(currentMappings, "\\\"", "")
+	currentMappings = strings.ReplaceAll(currentMappings, "\"", "")
+
+	// Determine the physical network name we should use
+	physicalNetwork := cfg.Gateway.Interface
+	if physicalNetwork == "" {
+		physicalNetwork = "external"
+	}
+
+	// Determine the bridge name
+	bridgeName := "br-ex"
+
+	// Build the correct mapping
+	correctMapping := fmt.Sprintf("%s:%s", physicalNetwork, bridgeName)
+
+	// Check if we need to fix anything
+	needsFix := false
+	var validMappings []string
+
+	if currentMappings != "" {
+		parts := strings.Split(currentMappings, ",")
+		for _, part := range parts {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+
+			// Check for invalid mappings (containing quotes or invalid characters)
+			if strings.ContainsAny(part, "\"'\\") {
+				klog.Warningf("Removing invalid bridge mapping: %q", part)
+				needsFix = true
+				continue
+			}
+
+			// Validate mapping format
+			colonIdx := strings.Index(part, ":")
+			if colonIdx <= 0 || colonIdx >= len(part)-1 {
+				klog.Warningf("Removing malformed bridge mapping: %q", part)
+				needsFix = true
+				continue
+			}
+
+			network := part[:colonIdx]
+			bridge := part[colonIdx+1:]
+
+			// Skip if this is the physical network we're configuring
+			if network == physicalNetwork {
+				continue
+			}
+
+			// Verify the bridge exists
+			if err := exec.Command("ovs-vsctl", "--timeout=5", "br-exists", bridge).Run(); err != nil {
+				klog.Warningf("Removing bridge mapping for non-existent bridge: %q", part)
+				needsFix = true
+				continue
+			}
+
+			validMappings = append(validMappings, part)
+		}
+	}
+
+	// Add our correct mapping
+	validMappings = append(validMappings, correctMapping)
+	finalMappings := strings.Join(validMappings, ",")
+
+	// Check if current mappings are already correct
+	if !needsFix && currentMappings == finalMappings {
+		klog.V(4).Infof("Bridge mappings already correct: %s", finalMappings)
+		return nil
+	}
+
+	// Set the corrected bridge mappings
+	klog.Infof("Setting bridge mappings: %s (was: %q)", finalMappings, currentMappings)
+	if err := exec.Command("ovs-vsctl", "--timeout=15", "set", "Open_vSwitch", ".",
+		fmt.Sprintf("external_ids:ovn-bridge-mappings=%s", finalMappings)).Run(); err != nil {
+		return fmt.Errorf("failed to set bridge mappings: %w", err)
+	}
+
 	return nil
 }
 
