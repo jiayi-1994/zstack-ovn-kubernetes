@@ -508,6 +508,12 @@ func updateCondition(conditions []metav1.Condition, newCondition metav1.Conditio
 func (r *SubnetReconciler) ensureRouterConnection(ctx context.Context, subnet *networkv1.Subnet, lsName string) error {
 	log := klog.FromContext(ctx).WithValues("subnet", subnet.Name, "logicalSwitch", lsName)
 
+	// Skip router connection for per-node subnets - Node Controller handles this
+	if subnet.Labels != nil && subnet.Labels["zstack.io/subnet-type"] == "per-node" {
+		log.V(4).Info("Skipping router connection for per-node subnet (handled by Node Controller)")
+		return nil
+	}
+
 	if r.lrOps == nil {
 		log.V(4).Info("LogicalRouterOps not initialized, skipping router connection")
 		return nil

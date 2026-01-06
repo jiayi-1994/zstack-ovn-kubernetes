@@ -107,10 +107,13 @@ rules:
     resources: ["events"]
     verbs: ["create", "patch", "update"]
   
-  # Custom Subnet CRD
+  # Custom Subnet CRD - Node agent needs create/update for per-node subnet mode
   - apiGroups: ["network.zstack.io"]
     resources: ["subnets"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["network.zstack.io"]
+    resources: ["subnets/status"]
+    verbs: ["get", "update", "patch"]
 ---
 # ClusterRoleBinding for Controller
 apiVersion: rbac.authorization.k8s.io/v1

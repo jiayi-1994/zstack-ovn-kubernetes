@@ -1185,13 +1185,20 @@ func matchLower(a, b string) bool {
 // ensureNodeSubnetCRD creates or updates a Subnet CRD for a node.
 // This allows the Pod Controller to find the subnet and allocate IPs for pods on this node.
 //
-// The Subnet CRD is named "node-<nodeName>" and references the OVN Logical Switch
-// created by ensureNodeLogicalSwitch.
+// The Subnet CRD is named "node-<nodeName>". In per-node subnet mode, the Node Controller
+// already creates the OVN Logical Switch, so we DON'T set ExternalLogicalSwitch here.
+// Instead, the Subnet Controller will skip creating a new switch because one with the
+// matching name already exists (handled by CreateOrUpdateLogicalSwitch).
 func (c *NodeController) ensureNodeSubnetCRD(ctx context.Context, node *corev1.Node, subnet *net.IPNet, gatewayIP net.IP) error {
 	subnetName := fmt.Sprintf("node-%s", node.Name)
-	lsName := c.getNodeLogicalSwitchName(node.Name)
 
 	// Build the Subnet CRD
+	// NOTE: We do NOT set ExternalLogicalSwitch because:
+	// 1. Node Controller already created the OVN switch "node-<nodeName>"
+	// 2. Setting ExternalLogicalSwitch would trigger verifyExternalLogicalSwitch which may fail
+	//    due to libovsdb cache sync delays
+	// 3. Subnet Controller's ensureLogicalSwitch uses CreateOrUpdateLogicalSwitch which is idempotent
+	//    and will just update the existing switch
 	subnetCRD := &networkv1.Subnet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: subnetName,
@@ -1201,12 +1208,12 @@ func (c *NodeController) ensureNodeSubnetCRD(ctx context.Context, node *corev1.N
 			},
 		},
 		Spec: networkv1.SubnetSpec{
-			CIDR:                  subnet.String(),
-			Gateway:               gatewayIP.String(),
-			ExcludeIPs:            []string{gatewayIP.String()},
-			ExternalLogicalSwitch: lsName, // Reference the OVN switch created by Node Controller
-			Protocol:              networkv1.SubnetProtocolIPv4,
-			Default:               false, // Per-node subnets are not default
+			CIDR:       subnet.String(),
+			Gateway:    gatewayIP.String(),
+			ExcludeIPs: []string{gatewayIP.String()},
+			// Don't set ExternalLogicalSwitch - let Subnet Controller handle it
+			Protocol: networkv1.SubnetProtocolIPv4,
+			Default:  false, // Per-node subnets are not default
 		},
 	}
 

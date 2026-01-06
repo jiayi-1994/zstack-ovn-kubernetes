@@ -144,6 +144,11 @@ func (s *Subnet) GetLogicalSwitchName() string {
 if s.IsExternalMode() {
 return s.Spec.ExternalLogicalSwitch
 }
+// For per-node subnets (created by Node Controller), the subnet name is "node-<nodeName>"
+// and the OVN switch name should also be "node-<nodeName>" (not "subnet-node-<nodeName>")
+if s.Labels != nil && s.Labels["zstack.io/subnet-type"] == "per-node" {
+return s.Name // Return "node-<nodeName>" directly
+}
 return "subnet-" + s.Name
 }
 
