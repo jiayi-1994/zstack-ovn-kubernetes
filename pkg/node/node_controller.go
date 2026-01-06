@@ -1181,3 +1181,75 @@ func matchLower(a, b string) bool {
 	}
 	return true
 }
+
+// ensureNodeSubnetCRD creates or updates a Subnet CRD for a node.
+// This allows the Pod Controller to find the subnet and allocate IPs for pods on this node.
+//
+// The Subnet CRD is named "node-<nodeName>" and references the OVN Logical Switch
+// created by ensureNodeLogicalSwitch.
+func (c *NodeController) ensureNodeSubnetCRD(ctx context.Context, node *corev1.Node, subnet *net.IPNet, gatewayIP net.IP) error {
+	subnetName := fmt.Sprintf("node-%s", node.Name)
+	lsName := c.getNodeLogicalSwitchName(node.Name)
+
+	// Build the Subnet CRD
+	subnetCRD := &networkv1.Subnet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: subnetName,
+			Labels: map[string]string{
+				"zstack.io/node":        node.Name,
+				"zstack.io/subnet-type": "per-node",
+			},
+		},
+		Spec: networkv1.SubnetSpec{
+			CIDR:                  subnet.String(),
+			Gateway:               gatewayIP.String(),
+			ExcludeIPs:            []string{gatewayIP.String()},
+			ExternalLogicalSwitch: lsName, // Reference the OVN switch created by Node Controller
+			Protocol:              networkv1.SubnetProtocolIPv4,
+			Default:               false, // Per-node subnets are not default
+		},
+	}
+
+	// Try to get existing subnet
+	existing := &networkv1.Subnet{}
+	err := c.client.Get(ctx, client.ObjectKey{Name: subnetName}, existing)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			// Create new subnet
+			if err := c.client.Create(ctx, subnetCRD); err != nil {
+				if errors.IsAlreadyExists(err) {
+					klog.V(4).Infof("Subnet CRD %s already exists", subnetName)
+					return nil
+				}
+				return fmt.Errorf("failed to create Subnet CRD %s: %w", subnetName, err)
+			}
+			klog.Infof("Created Subnet CRD %s for node %s", subnetName, node.Name)
+			return nil
+		}
+		return fmt.Errorf("failed to get Subnet CRD %s: %w", subnetName, err)
+	}
+
+	// Update existing subnet if needed
+	needsUpdate := false
+	if existing.Spec.CIDR != subnetCRD.Spec.CIDR {
+		existing.Spec.CIDR = subnetCRD.Spec.CIDR
+		needsUpdate = true
+	}
+	if existing.Spec.Gateway != subnetCRD.Spec.Gateway {
+		existing.Spec.Gateway = subnetCRD.Spec.Gateway
+		needsUpdate = true
+	}
+	if existing.Spec.ExternalLogicalSwitch != subnetCRD.Spec.ExternalLogicalSwitch {
+		existing.Spec.ExternalLogicalSwitch = subnetCRD.Spec.ExternalLogicalSwitch
+		needsUpdate = true
+	}
+
+	if needsUpdate {
+		if err := c.client.Update(ctx, existing); err != nil {
+			return fmt.Errorf("failed to update Subnet CRD %s: %w", subnetName, err)
+		}
+		klog.Infof("Updated Subnet CRD %s for node %s", subnetName, node.Name)
+	}
+
+	return nil
+}
