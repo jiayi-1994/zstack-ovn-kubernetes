@@ -1,21 +1,65 @@
+//go:build linux
+// +build linux
+
 // Package node provides gateway auto-detection functionality.
 //
 // This file implements automatic detection of:
-// - Default gateway interface and IP
+// - Default gateway interface and IP using netlink
 // - Node's external IP address
 // - OVS bridge mappings
 //
-// Reference: OVN-Kubernetes pkg/node/helper_linux.go
+// Reference: OVN-Kubernetes pkg/node/helper_linux.go and pkg/node/gateway_init.go
 package node
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
 	"os/exec"
 	"strings"
 
+	"github.com/vishvananda/netlink"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
 )
+
+// L3GatewayConfig represents the gateway configuration for a node.
+// This is saved to node annotations and read by the controller.
+// Reference: ovn-kubernetes util.L3GatewayConfig
+type L3GatewayConfig struct {
+	// Mode is the gateway mode (shared, local, disabled)
+	Mode string `json:"mode"`
+
+	// ChassisID is the OVN chassis ID for this node
+	ChassisID string `json:"chassis-id,omitempty"`
+
+	// InterfaceID is the OVN interface ID for the gateway port
+	InterfaceID string `json:"interface-id,omitempty"`
+
+	// BridgeID is the OVS bridge name (e.g., "br-ex")
+	BridgeID string `json:"bridge-id,omitempty"`
+
+	// MACAddress is the MAC address of the gateway interface
+	MACAddress string `json:"mac-address,omitempty"`
+
+	// IPAddresses are the IP addresses on the gateway interface (CIDR format)
+	IPAddresses []string `json:"ip-addresses,omitempty"`
+
+	// NextHops are the default gateway IPs
+	NextHops []string `json:"next-hops,omitempty"`
+
+	// NodePortEnable indicates if NodePort is enabled
+	NodePortEnable bool `json:"node-port-enable,omitempty"`
+
+	// VLANID is the VLAN ID for the external network (0 for untagged)
+	VLANID int `json:"vlan-id,omitempty"`
+}
+
+// L3GatewayAnnotation is the annotation key for L3 gateway config
+const L3GatewayAnnotation = "zstack.io/l3-gateway-config"
+
+// ChassisIDAnnotation is the annotation key for chassis ID
+const ChassisIDAnnotation = "zstack.io/node-chassis-id"
 
 // GatewayInfo contains auto-detected gateway information
 type GatewayInfo struct {
@@ -28,12 +72,18 @@ type GatewayInfo struct {
 	// NodeIP is the node's IP address on the gateway interface
 	NodeIP net.IP
 
+	// NodeIPNet is the node's IP address with subnet mask
+	NodeIPNet *net.IPNet
+
 	// BridgeName is the OVS bridge name (if detected)
 	BridgeName string
+
+	// MACAddress is the MAC address of the gateway interface
+	MACAddress net.HardwareAddr
 }
 
-// DetectGatewayInfo automatically detects gateway configuration from the system.
-// This reads the routing table to find the default gateway and interface.
+// DetectGatewayInfo automatically detects gateway configuration from the system
+// using netlink to query the routing table.
 //
 // Returns:
 //   - *GatewayInfo: Detected gateway information
@@ -41,21 +91,28 @@ type GatewayInfo struct {
 func DetectGatewayInfo() (*GatewayInfo, error) {
 	info := &GatewayInfo{}
 
-	// Detect default gateway interface and IP
-	intfName, gwIP, err := getDefaultGateway()
+	// Detect default gateway interface and IP using netlink
+	intfName, gwIP, err := getDefaultGatewayNetlink()
 	if err != nil {
-		return nil, fmt.Errorf("failed to detect default gateway: %w", err)
+		// Fall back to command-based detection
+		klog.V(4).Infof("Netlink detection failed, falling back to command: %v", err)
+		intfName, gwIP, err = getDefaultGatewayCommand()
+		if err != nil {
+			return nil, fmt.Errorf("failed to detect default gateway: %w", err)
+		}
 	}
 
 	info.InterfaceName = intfName
 	info.GatewayIP = gwIP
 
-	// Get node's IP on the gateway interface
-	nodeIP, err := getInterfaceIP(intfName)
+	// Get node's IP and MAC on the gateway interface
+	nodeIPNet, mac, err := getInterfaceDetails(intfName)
 	if err != nil {
-		klog.Warningf("Failed to get IP for interface %s: %v", intfName, err)
+		klog.Warningf("Failed to get details for interface %s: %v", intfName, err)
 	} else {
-		info.NodeIP = nodeIP
+		info.NodeIPNet = nodeIPNet
+		info.NodeIP = nodeIPNet.IP
+		info.MACAddress = mac
 	}
 
 	// Try to detect OVS bridge
@@ -66,17 +123,51 @@ func DetectGatewayInfo() (*GatewayInfo, error) {
 		info.BridgeName = bridgeName
 	}
 
-	klog.Infof("Detected gateway info: interface=%s, gateway=%s, nodeIP=%s, bridge=%s",
-		info.InterfaceName, info.GatewayIP, info.NodeIP, info.BridgeName)
+	klog.Infof("Detected gateway info: interface=%s, gateway=%s, nodeIP=%s, mac=%s, bridge=%s",
+		info.InterfaceName, info.GatewayIP, info.NodeIP, info.MACAddress, info.BridgeName)
 
 	return info, nil
 }
 
-// getDefaultGateway reads the routing table to find the default gateway.
-// Returns the interface name and gateway IP.
-func getDefaultGateway() (string, net.IP, error) {
-	// Use 'ip route' command to get default route
-	// Format: default via 192.168.1.1 dev eth0 proto static metric 100
+// getDefaultGatewayNetlink uses netlink to find the default gateway.
+// This is the preferred method as it's more reliable than parsing command output.
+// Reference: ovn-kubernetes pkg/node/helper_linux.go getDefaultGatewayInterfaceByFamily
+func getDefaultGatewayNetlink() (string, net.IP, error) {
+	// Get IPv4 default route
+	routes, err := netlink.RouteList(nil, netlink.FAMILY_V4)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to list routes: %w", err)
+	}
+
+	for _, route := range routes {
+		// Default route has Dst == nil
+		if route.Dst != nil {
+			continue
+		}
+
+		// Skip routes without gateway
+		if route.Gw == nil {
+			continue
+		}
+
+		// Get interface name
+		link, err := netlink.LinkByIndex(route.LinkIndex)
+		if err != nil {
+			klog.V(4).Infof("Failed to get link for index %d: %v", route.LinkIndex, err)
+			continue
+		}
+
+		intfName := link.Attrs().Name
+		klog.V(4).Infof("Found default route via netlink: gateway=%s, interface=%s", route.Gw, intfName)
+		return intfName, route.Gw, nil
+	}
+
+	return "", nil, fmt.Errorf("no default gateway found via netlink")
+}
+
+// getDefaultGatewayCommand reads the routing table using 'ip route' command.
+// This is a fallback method if netlink fails.
+func getDefaultGatewayCommand() (string, net.IP, error) {
 	output, err := exec.Command("ip", "route", "show", "default").Output()
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to execute 'ip route show default': %w", err)
@@ -89,7 +180,6 @@ func getDefaultGateway() (string, net.IP, error) {
 			continue
 		}
 
-		// Parse: default via <gateway> dev <interface>
 		if fields[0] != "default" {
 			continue
 		}
@@ -107,7 +197,7 @@ func getDefaultGateway() (string, net.IP, error) {
 		}
 
 		if gwIP != nil && intfName != "" {
-			klog.V(4).Infof("Found default route: gateway=%s, interface=%s", gwIP, intfName)
+			klog.V(4).Infof("Found default route via command: gateway=%s, interface=%s", gwIP, intfName)
 			return intfName, gwIP, nil
 		}
 	}
@@ -115,49 +205,50 @@ func getDefaultGateway() (string, net.IP, error) {
 	return "", nil, fmt.Errorf("no default gateway found in routing table")
 }
 
-// getInterfaceIP gets the primary IP address of an interface.
-func getInterfaceIP(intfName string) (net.IP, error) {
-	iface, err := net.InterfaceByName(intfName)
+// getInterfaceDetails gets the IP address and MAC address of an interface.
+func getInterfaceDetails(intfName string) (*net.IPNet, net.HardwareAddr, error) {
+	link, err := netlink.LinkByName(intfName)
 	if err != nil {
-		return nil, fmt.Errorf("interface %s not found: %w", intfName, err)
+		return nil, nil, fmt.Errorf("interface %s not found: %w", intfName, err)
 	}
 
-	addrs, err := iface.Addrs()
+	mac := link.Attrs().HardwareAddr
+
+	// Get addresses
+	addrs, err := netlink.AddrList(link, netlink.FAMILY_V4)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get addresses for interface %s: %w", intfName, err)
+		return nil, mac, fmt.Errorf("failed to get addresses for %s: %w", intfName, err)
 	}
 
 	for _, addr := range addrs {
-		ipNet, ok := addr.(*net.IPNet)
-		if !ok {
+		if addr.IP.IsLoopback() || addr.IP.IsLinkLocalUnicast() {
 			continue
 		}
-
-		// Skip loopback and link-local addresses
-		ip := ipNet.IP.To4()
-		if ip == nil {
-			continue // Skip IPv6 for now
-		}
-		if ip.IsLoopback() || ip.IsLinkLocalUnicast() {
-			continue
-		}
-
-		return ip, nil
+		return addr.IPNet, mac, nil
 	}
 
-	return nil, fmt.Errorf("no valid IP address found on interface %s", intfName)
+	return nil, mac, fmt.Errorf("no valid IP address found on interface %s", intfName)
+}
+
+// getInterfaceIP gets the primary IP address of an interface (legacy function).
+func getInterfaceIP(intfName string) (net.IP, error) {
+	ipNet, _, err := getInterfaceDetails(intfName)
+	if err != nil {
+		return nil, err
+	}
+	return ipNet.IP, nil
 }
 
 // detectOVSBridge tries to detect if the interface is part of an OVS bridge.
 func detectOVSBridge(intfName string) (string, error) {
 	// Check if interface is an OVS bridge
-	output, err := exec.Command("ovs-vsctl", "--timeout=5", "br-exists", intfName).CombinedOutput()
+	err := exec.Command("ovs-vsctl", "--timeout=5", "br-exists", intfName).Run()
 	if err == nil {
-		return intfName, nil // Interface itself is a bridge
+		return intfName, nil
 	}
 
 	// Check if interface is a port on an OVS bridge
-	output, err = exec.Command("ovs-vsctl", "--timeout=5", "port-to-br", intfName).Output()
+	output, err := exec.Command("ovs-vsctl", "--timeout=5", "port-to-br", intfName).Output()
 	if err == nil {
 		bridgeName := strings.TrimSpace(string(output))
 		if bridgeName != "" {
@@ -166,7 +257,7 @@ func detectOVSBridge(intfName string) (string, error) {
 	}
 
 	// Check for br-ex (common external bridge name)
-	output, err = exec.Command("ovs-vsctl", "--timeout=5", "br-exists", "br-ex").CombinedOutput()
+	err = exec.Command("ovs-vsctl", "--timeout=5", "br-exists", "br-ex").Run()
 	if err == nil {
 		return "br-ex", nil
 	}
@@ -175,16 +266,7 @@ func detectOVSBridge(intfName string) (string, error) {
 }
 
 // GetOrCreateExternalBridge ensures an external OVS bridge exists.
-// If the bridge doesn't exist, it creates one and adds the physical interface to it.
-//
-// Parameters:
-//   - bridgeName: Name of the bridge to create (e.g., "br-ex")
-//   - physicalIntf: Physical interface to add to the bridge
-//
-// Returns:
-//   - error: Creation error
 func GetOrCreateExternalBridge(bridgeName, physicalIntf string) error {
-	// Check if bridge already exists
 	err := exec.Command("ovs-vsctl", "--timeout=5", "br-exists", bridgeName).Run()
 	if err == nil {
 		klog.V(4).Infof("OVS bridge %s already exists", bridgeName)
@@ -193,16 +275,13 @@ func GetOrCreateExternalBridge(bridgeName, physicalIntf string) error {
 
 	klog.Infof("Creating OVS bridge %s with interface %s", bridgeName, physicalIntf)
 
-	// Create the bridge
 	if err := exec.Command("ovs-vsctl", "--timeout=15", "--may-exist", "add-br", bridgeName).Run(); err != nil {
 		return fmt.Errorf("failed to create OVS bridge %s: %w", bridgeName, err)
 	}
 
-	// Add physical interface to bridge (if specified and not the bridge itself)
 	if physicalIntf != "" && physicalIntf != bridgeName {
 		if err := exec.Command("ovs-vsctl", "--timeout=15", "--may-exist", "add-port", bridgeName, physicalIntf).Run(); err != nil {
 			klog.Warningf("Failed to add interface %s to bridge %s: %v", physicalIntf, bridgeName, err)
-			// Don't fail - the interface might already be managed differently
 		}
 	}
 
@@ -210,32 +289,20 @@ func GetOrCreateExternalBridge(bridgeName, physicalIntf string) error {
 }
 
 // EnsureBridgeMapping ensures the OVN bridge mapping is configured.
-// This sets the ovn-bridge-mappings external-id on Open_vSwitch.
-//
-// Parameters:
-//   - physicalNetwork: Name of the physical network (e.g., "external")
-//   - bridgeName: Name of the OVS bridge (e.g., "br-ex")
-//
-// Returns:
-//   - error: Configuration error
 func EnsureBridgeMapping(physicalNetwork, bridgeName string) error {
-	// Get current bridge mappings
 	output, err := exec.Command("ovs-vsctl", "--timeout=5", "--if-exists", "get",
 		"Open_vSwitch", ".", "external_ids:ovn-bridge-mappings").Output()
 	if err != nil {
 		klog.V(4).Infof("No existing bridge mappings found: %v", err)
 	}
 
-	// Clean up the output - remove quotes and whitespace
 	currentMappings := strings.TrimSpace(string(output))
 	currentMappings = strings.Trim(currentMappings, "\"")
-	// Also remove any escaped quotes that might be in the string
 	currentMappings = strings.ReplaceAll(currentMappings, "\\\"", "")
 	currentMappings = strings.ReplaceAll(currentMappings, "\"", "")
 
 	newMapping := fmt.Sprintf("%s:%s", physicalNetwork, bridgeName)
 
-	// Build new mappings string, filtering out invalid entries
 	var validMappings []string
 	if currentMappings != "" {
 		parts := strings.Split(currentMappings, ",")
@@ -245,7 +312,6 @@ func EnsureBridgeMapping(physicalNetwork, bridgeName string) error {
 				continue
 			}
 
-			// Validate mapping format: should be "network:bridge"
 			colonIdx := strings.Index(part, ":")
 			if colonIdx <= 0 || colonIdx >= len(part)-1 {
 				klog.Warningf("Skipping invalid bridge mapping: %q", part)
@@ -255,18 +321,15 @@ func EnsureBridgeMapping(physicalNetwork, bridgeName string) error {
 			network := part[:colonIdx]
 			bridge := part[colonIdx+1:]
 
-			// Skip if bridge name contains invalid characters (like quotes)
 			if strings.ContainsAny(bridge, "\"'\\") {
 				klog.Warningf("Skipping bridge mapping with invalid bridge name: %q", part)
 				continue
 			}
 
-			// Skip if this is the same physical network we're configuring
 			if network == physicalNetwork {
 				continue
 			}
 
-			// Verify the bridge exists before keeping the mapping
 			if err := exec.Command("ovs-vsctl", "--timeout=5", "br-exists", bridge).Run(); err != nil {
 				klog.Warningf("Skipping bridge mapping for non-existent bridge: %q", part)
 				continue
@@ -276,19 +339,14 @@ func EnsureBridgeMapping(physicalNetwork, bridgeName string) error {
 		}
 	}
 
-	// Add our new mapping
 	validMappings = append(validMappings, newMapping)
-
-	// Build final mappings string
 	mappings := strings.Join(validMappings, ",")
 
-	// Check if we need to update
 	if currentMappings == mappings {
 		klog.V(4).Infof("Bridge mapping %s already correctly configured", newMapping)
 		return nil
 	}
 
-	// Set the bridge mapping
 	klog.Infof("Setting OVN bridge mapping: %s (was: %s)", mappings, currentMappings)
 	if err := exec.Command("ovs-vsctl", "--timeout=15", "set", "Open_vSwitch", ".",
 		fmt.Sprintf("external_ids:ovn-bridge-mappings=%s", mappings)).Run(); err != nil {
@@ -299,43 +357,138 @@ func EnsureBridgeMapping(physicalNetwork, bridgeName string) error {
 }
 
 // AutoConfigureGateway automatically configures the gateway for external network access.
-// This is a convenience function that:
-// 1. Detects the default gateway
-// 2. Creates/ensures the external OVS bridge
-// 3. Configures the OVN bridge mapping
+// This does NOT migrate the physical interface to br-ex. Instead, it:
+// 1. Detects the default gateway interface and IP using netlink
+// 2. Creates br-ex bridge (empty, for OVN localnet port)
+// 3. Configures bridge mapping for OVN
 //
-// Parameters:
-//   - physicalNetwork: Name of the physical network for OVN (e.g., "external")
-//
-// Returns:
-//   - *GatewayInfo: Detected and configured gateway information
-//   - error: Configuration error
+// Traffic flow relies on host routing:
+// Pod -> OVN SNAT -> host routing table -> physical interface -> external network
 func AutoConfigureGateway(physicalNetwork string) (*GatewayInfo, error) {
-	// Detect gateway info
 	info, err := DetectGatewayInfo()
 	if err != nil {
 		return nil, fmt.Errorf("failed to detect gateway: %w", err)
 	}
 
-	// Determine bridge name
-	bridgeName := info.BridgeName
-	if bridgeName == "" {
-		bridgeName = "br-ex" // Default external bridge name
-	}
-
-	// Ensure bridge exists
-	// Note: We don't automatically add the physical interface to avoid disrupting network
-	// In production, this should be done carefully or via a separate setup script
+	// Create br-ex bridge (without adding physical interface)
+	// This is needed for OVN localnet port, but traffic will use host routing
+	bridgeName := "br-ex"
 	if err := GetOrCreateExternalBridge(bridgeName, ""); err != nil {
 		klog.Warningf("Failed to create external bridge: %v", err)
-		// Continue anyway - bridge might be managed externally
 	}
 
-	// Ensure bridge mapping
+	// Configure bridge mapping for OVN
 	if err := EnsureBridgeMapping(physicalNetwork, bridgeName); err != nil {
 		return nil, fmt.Errorf("failed to configure bridge mapping: %w", err)
 	}
 
 	info.BridgeName = bridgeName
 	return info, nil
+}
+
+
+// MigrateInterfaceToBridge is deprecated and no longer used.
+// We now use host routing instead of migrating the physical interface to OVS bridge.
+// This function is kept for backward compatibility but does nothing.
+func MigrateInterfaceToBridge(physicalIntf, bridgeName string) error {
+	klog.Warningf("MigrateInterfaceToBridge is deprecated, using host routing instead")
+	return nil
+}
+
+// EnsureExternalBridgeWithInterface is deprecated.
+// Use AutoConfigureGateway instead, which does not modify the physical interface.
+func EnsureExternalBridgeWithInterface(physicalNetwork string) (*GatewayInfo, error) {
+	klog.Warningf("EnsureExternalBridgeWithInterface is deprecated, using AutoConfigureGateway instead")
+	return AutoConfigureGateway(physicalNetwork)
+}
+
+// BuildL3GatewayConfig builds an L3GatewayConfig from detected gateway info.
+// This is saved to node annotations for the controller to read.
+func BuildL3GatewayConfig(info *GatewayInfo, chassisID string, vlanID int) *L3GatewayConfig {
+	cfg := &L3GatewayConfig{
+		Mode:           "shared",
+		ChassisID:      chassisID,
+		BridgeID:       info.BridgeName,
+		NodePortEnable: true,
+		VLANID:         vlanID,
+	}
+
+	if info.BridgeName != "" {
+		cfg.InterfaceID = fmt.Sprintf("%s_", info.BridgeName)
+	}
+
+	if info.MACAddress != nil {
+		cfg.MACAddress = info.MACAddress.String()
+	}
+
+	if info.NodeIPNet != nil {
+		cfg.IPAddresses = []string{info.NodeIPNet.String()}
+	}
+
+	if info.GatewayIP != nil {
+		cfg.NextHops = []string{info.GatewayIP.String()}
+	}
+
+	return cfg
+}
+
+// SetL3GatewayAnnotation sets the L3 gateway config annotation on a node.
+func SetL3GatewayAnnotation(node *corev1.Node, cfg *L3GatewayConfig) error {
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal L3GatewayConfig: %w", err)
+	}
+
+	if node.Annotations == nil {
+		node.Annotations = make(map[string]string)
+	}
+	node.Annotations[L3GatewayAnnotation] = string(data)
+
+	if cfg.ChassisID != "" {
+		node.Annotations[ChassisIDAnnotation] = cfg.ChassisID
+	}
+
+	return nil
+}
+
+// ParseL3GatewayAnnotation parses the L3 gateway config from node annotations.
+func ParseL3GatewayAnnotation(node *corev1.Node) (*L3GatewayConfig, error) {
+	if node.Annotations == nil {
+		return nil, fmt.Errorf("node %s has no annotations", node.Name)
+	}
+
+	data, ok := node.Annotations[L3GatewayAnnotation]
+	if !ok {
+		return nil, fmt.Errorf("node %s has no L3 gateway annotation", node.Name)
+	}
+
+	cfg := &L3GatewayConfig{}
+	if err := json.Unmarshal([]byte(data), cfg); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal L3GatewayConfig: %w", err)
+	}
+
+	// Also get chassis ID from separate annotation if not in config
+	if cfg.ChassisID == "" {
+		if chassisID, ok := node.Annotations[ChassisIDAnnotation]; ok {
+			cfg.ChassisID = chassisID
+		}
+	}
+
+	return cfg, nil
+}
+
+// GetChassisID gets the OVN chassis ID for this node.
+func GetChassisID() (string, error) {
+	output, err := exec.Command("ovs-vsctl", "--timeout=5", "get", "Open_vSwitch", ".", "external_ids:system-id").Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to get chassis ID: %w", err)
+	}
+
+	chassisID := strings.TrimSpace(string(output))
+	chassisID = strings.Trim(chassisID, "\"")
+	if chassisID == "" {
+		return "", fmt.Errorf("empty chassis ID")
+	}
+
+	return chassisID, nil
 }

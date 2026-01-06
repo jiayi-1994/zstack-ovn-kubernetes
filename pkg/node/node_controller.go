@@ -921,9 +921,12 @@ func (c *NodeController) ensureJoinNetwork(ctx context.Context) error {
 // 4. Adds SNAT rules for the cluster CIDR
 // 5. Adds default route via external gateway
 //
-// Note: This is a simplified implementation compared to ovn-kubernetes's per-node
-// Gateway Router (GR_<node>) architecture. It relies on OVN's distributed gateway
-// capabilities and automatic detection of network configuration.
+// This implementation follows ovn-kubernetes patterns:
+// - Node agent detects gateway config using netlink
+// - Config is saved to Node annotation (L3GatewayConfig)
+// - Controller reads annotation and configures OVN
+//
+// Reference: ovn-kubernetes pkg/node/gateway_init.go and pkg/node/gateway.go
 func (c *NodeController) ensureDistributedGateway(ctx context.Context, node *corev1.Node) error {
 	if c.ovnClient == nil || !c.ovnClient.IsConnected() {
 		klog.V(4).Infof("OVN client not connected, skipping gateway configuration for node %s", node.Name)
@@ -934,46 +937,44 @@ func (c *NodeController) ensureDistributedGateway(ctx context.Context, node *cor
 		return fmt.Errorf("logical router ops not initialized")
 	}
 
-	// Get node's internal IP (used for SNAT)
-	nodeIP := c.getNodeInternalIP(node)
+	// Try to get L3 gateway config from node annotation first (ovn-kubernetes style)
+	l3GwConfig, err := ParseL3GatewayAnnotation(node)
+	if err != nil {
+		klog.V(4).Infof("No L3 gateway annotation on node %s, will auto-detect: %v", node.Name, err)
+		// Auto-detect and save to annotation
+		l3GwConfig, err = c.detectAndSaveGatewayConfig(ctx, node)
+		if err != nil {
+			return fmt.Errorf("failed to detect gateway config: %w", err)
+		}
+	}
+
+	// Get node IP from annotation or detect
+	var nodeIP string
+	if len(l3GwConfig.IPAddresses) > 0 {
+		// Parse IP from CIDR format
+		ip, _, err := net.ParseCIDR(l3GwConfig.IPAddresses[0])
+		if err == nil {
+			nodeIP = ip.String()
+		}
+	}
 	if nodeIP == "" {
-		klog.Warningf("No internal IP found for node %s, skipping gateway configuration", node.Name)
+		nodeIP = c.getNodeInternalIP(node)
+	}
+	if nodeIP == "" {
+		klog.Warningf("No IP found for node %s, skipping gateway configuration", node.Name)
 		return nil
 	}
 
-	// Auto-detect or use configured gateway settings
+	// Get next hop from annotation
 	var nextHop string
-	var physicalNetwork string
+	if len(l3GwConfig.NextHops) > 0 {
+		nextHop = l3GwConfig.NextHops[0]
+	}
 
-	// Check if gateway is explicitly configured
-	if c.config.Gateway.NextHop != "" {
-		nextHop = c.config.Gateway.NextHop
-		physicalNetwork = c.config.Gateway.Interface
-		if physicalNetwork == "" {
-			physicalNetwork = "external"
-		}
-		klog.V(4).Infof("Using configured gateway: nextHop=%s, physicalNetwork=%s", nextHop, physicalNetwork)
-	} else {
-		// Auto-detect gateway configuration
-		klog.V(4).Infof("Auto-detecting gateway configuration for node %s", node.Name)
-
-		physicalNetwork = c.config.Gateway.Interface
-		if physicalNetwork == "" {
-			physicalNetwork = "external"
-		}
-
-		gwInfo, err := AutoConfigureGateway(physicalNetwork)
-		if err != nil {
-			klog.Warningf("Failed to auto-configure gateway for node %s: %v, falling back to simple inference", node.Name, err)
-			// Fall back to simple gateway inference
-			nextHop = c.inferNodeGateway(nodeIP)
-		} else {
-			if gwInfo.GatewayIP != nil {
-				nextHop = gwInfo.GatewayIP.String()
-			}
-			klog.Infof("Auto-detected gateway for node %s: nextHop=%s, interface=%s, bridge=%s",
-				node.Name, nextHop, gwInfo.InterfaceName, gwInfo.BridgeName)
-		}
+	// Get physical network name
+	physicalNetwork := c.config.Gateway.Interface
+	if physicalNetwork == "" {
+		physicalNetwork = "external"
 	}
 
 	// Set up default route and SNAT (only for first node / gateway node)
@@ -986,7 +987,6 @@ func (c *NodeController) ensureDistributedGateway(ctx context.Context, node *cor
 
 	if isFirstGateway {
 		// Add SNAT rule for cluster CIDR
-		// This allows all pods to access external networks using the gateway node's IP
 		if err := c.lrOps.EnsureSNATForCluster(ctx, nodeIP, c.config.Network.ClusterCIDR); err != nil {
 			return fmt.Errorf("failed to add cluster SNAT: %w", err)
 		}
@@ -996,7 +996,6 @@ func (c *NodeController) ensureDistributedGateway(ctx context.Context, node *cor
 		if nextHop != "" {
 			if err := c.ensureExternalConnectivity(ctx, node, nodeIP, nextHop, physicalNetwork); err != nil {
 				klog.Warningf("Failed to configure external connectivity for node %s: %v", node.Name, err)
-				// Don't fail - basic SNAT is still configured, external access might work via other means
 				// Fall back to join network routing
 				joinRouterIP := "100.64.0.1"
 				if err := c.lrOps.EnsureDefaultRoute(ctx, joinRouterIP); err != nil {
@@ -1005,7 +1004,6 @@ func (c *NodeController) ensureDistributedGateway(ctx context.Context, node *cor
 			}
 		} else {
 			klog.Warningf("No next hop configured for node %s, using join network for routing", node.Name)
-			// Add a default route via join network for internal routing
 			joinRouterIP := "100.64.0.1"
 			if err := c.lrOps.EnsureDefaultRoute(ctx, joinRouterIP); err != nil {
 				klog.Warningf("Failed to add default route via join network: %v", err)
@@ -1020,23 +1018,75 @@ func (c *NodeController) ensureDistributedGateway(ctx context.Context, node *cor
 	return nil
 }
 
-// inferNodeGateway infers the default gateway IP from the node's IP.
-// This assumes a common pattern where the gateway is x.x.x.1 in the node's subnet.
-func (c *NodeController) inferNodeGateway(nodeIP string) string {
-	ip := net.ParseIP(nodeIP)
-	if ip == nil {
-		return ""
+// detectAndSaveGatewayConfig auto-detects gateway configuration and saves it to node annotation.
+// This follows the ovn-kubernetes pattern where node agent detects config and saves to annotation.
+//
+// Important: This does NOT modify the physical network interface. Traffic flows through
+// host routing: Pod -> OVN SNAT -> host routing table -> physical interface -> external network
+func (c *NodeController) detectAndSaveGatewayConfig(ctx context.Context, node *corev1.Node) (*L3GatewayConfig, error) {
+	var gwInfo *GatewayInfo
+	var err error
+
+	physicalNetwork := c.config.Gateway.Interface
+	if physicalNetwork == "" {
+		physicalNetwork = "external"
 	}
 
-	ip4 := ip.To4()
-	if ip4 == nil {
-		return "" // IPv6 not supported in this simple implementation
+	// Check if gateway is explicitly configured
+	if c.config.Gateway.NextHop != "" {
+		// Use configured values
+		gwInfo = &GatewayInfo{
+			GatewayIP: net.ParseIP(c.config.Gateway.NextHop),
+		}
+		// Get node IP from Kubernetes node status
+		nodeIP := c.getNodeInternalIP(node)
+		if nodeIP != "" {
+			gwInfo.NodeIP = net.ParseIP(nodeIP)
+		}
+		klog.V(4).Infof("Using configured gateway: nextHop=%s", c.config.Gateway.NextHop)
+	} else {
+		// Auto-detect gateway using netlink (does NOT modify physical interface)
+		klog.Infof("Auto-detecting gateway for node %s using netlink", node.Name)
+
+		gwInfo, err = AutoConfigureGateway(physicalNetwork)
+		if err != nil {
+			// Fall back to simple detection without bridge setup
+			klog.Warningf("Failed to auto-configure gateway: %v, trying simple detection", err)
+			gwInfo, err = DetectGatewayInfo()
+			if err != nil {
+				return nil, fmt.Errorf("failed to detect gateway info: %w", err)
+			}
+		}
+
+		klog.Infof("Detected gateway for node %s: interface=%s, gateway=%s, nodeIP=%s",
+			node.Name, gwInfo.InterfaceName, gwInfo.GatewayIP, gwInfo.NodeIP)
 	}
 
-	// Assume /24 subnet and gateway at .1
-	// This is a common pattern but may not work for all networks
-	gateway := net.IPv4(ip4[0], ip4[1], ip4[2], 1)
-	return gateway.String()
+	// Get chassis ID
+	chassisID, err := GetChassisID()
+	if err != nil {
+		klog.Warningf("Failed to get chassis ID: %v", err)
+		chassisID = ""
+	}
+
+	// Build L3GatewayConfig
+	l3GwConfig := BuildL3GatewayConfig(gwInfo, chassisID, c.config.Gateway.VLANID)
+
+	// Save to node annotation
+	nodeCopy := node.DeepCopy()
+	if err := SetL3GatewayAnnotation(nodeCopy, l3GwConfig); err != nil {
+		return nil, fmt.Errorf("failed to set L3 gateway annotation: %w", err)
+	}
+
+	// Update node
+	if err := c.client.Update(ctx, nodeCopy); err != nil {
+		klog.Warningf("Failed to update node %s with L3 gateway annotation: %v", node.Name, err)
+		// Don't fail - we can still use the detected config
+	} else {
+		klog.Infof("Saved L3 gateway config to node %s annotation", node.Name)
+	}
+
+	return l3GwConfig, nil
 }
 
 // ensureExternalConnectivity configures the node's OVS bridge for external traffic.
