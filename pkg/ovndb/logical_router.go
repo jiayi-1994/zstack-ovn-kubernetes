@@ -1594,15 +1594,20 @@ func (o *LogicalRouterOps) EnsureDefaultRouteViaExternal(ctx context.Context, ne
 	return nil
 }
 
-// EnsureExternalConnectivityInSingleTx creates external switch, router port, and default route
+// EnsureExternalConnectivityInSingleTx creates external switch, router port, gateway chassis, and default route
 // in a single transaction to avoid cache sync issues.
 //
 // This is the recommended way to set up external connectivity as it avoids
 // race conditions between creating the external switch and connecting it to the router.
 //
+// IMPORTANT: The gateway chassis binding is essential for external connectivity.
+// Without it, OVN doesn't know which physical node should handle traffic for the
+// gateway router port, and packets will be dropped.
+//
 // Parameters:
 //   - ctx: Context
 //   - nodeName: Name of the node
+//   - chassisID: The OVN chassis ID for this node (from SB database)
 //   - gatewayIP: Gateway IP on the external network (node's physical IP)
 //   - gatewayMAC: MAC address for the gateway port
 //   - nextHop: Next hop IP for default route (external gateway)
@@ -1611,6 +1616,54 @@ func (o *LogicalRouterOps) EnsureDefaultRouteViaExternal(ctx context.Context, ne
 func (o *LogicalRouterOps) EnsureExternalConnectivityInSingleTx(
 	ctx context.Context,
 	nodeName string,
+	gatewayIP string,
+	gatewayMAC string,
+	nextHop string,
+	physicalNetwork string,
+	vlanID int,
+) error {
+	// Get chassis ID from SB database
+	chassisID, err := o.getChassisID(ctx, nodeName)
+	if err != nil {
+		return fmt.Errorf("failed to get chassis ID for node %s: %w", nodeName, err)
+	}
+
+	return o.ensureExternalConnectivityWithChassis(ctx, nodeName, chassisID, gatewayIP, gatewayMAC, nextHop, physicalNetwork, vlanID)
+}
+
+// getChassisID retrieves the chassis ID for a node from the SB database
+func (o *LogicalRouterOps) getChassisID(ctx context.Context, nodeName string) (string, error) {
+	sbClient := o.client.SBClient()
+	if sbClient == nil {
+		// If SB client is not available, use node name as chassis ID (common convention)
+		klog.V(4).Infof("SB client not available, using node name %s as chassis ID", nodeName)
+		return nodeName, nil
+	}
+
+	// Try to find chassis by hostname
+	var chassisList []*Chassis
+	err := sbClient.WhereCache(func(c *Chassis) bool {
+		return c.Hostname == nodeName || c.Name == nodeName
+	}).List(ctx, &chassisList)
+	if err != nil {
+		klog.V(4).Infof("Failed to query chassis for node %s: %v, using node name as chassis ID", nodeName, err)
+		return nodeName, nil
+	}
+
+	if len(chassisList) > 0 {
+		return chassisList[0].Name, nil
+	}
+
+	// Fallback to node name
+	klog.V(4).Infof("No chassis found for node %s, using node name as chassis ID", nodeName)
+	return nodeName, nil
+}
+
+// ensureExternalConnectivityWithChassis creates external switch, router port, gateway chassis, and default route
+func (o *LogicalRouterOps) ensureExternalConnectivityWithChassis(
+	ctx context.Context,
+	nodeName string,
+	chassisID string,
 	gatewayIP string,
 	gatewayMAC string,
 	nextHop string,
@@ -1626,13 +1679,20 @@ func (o *LogicalRouterOps) EnsureExternalConnectivityInSingleTx(
 	localnetPortName := GetLocalnetPortName(nodeName)
 	lrpName := GatewayRouterPortPrefix + nodeName
 	lspName := "etor-" + nodeName
+	gwChassisName := lrpName + "-" + chassisID
 
 	// Check if router port already exists (means setup is complete)
 	existingLRP := &LogicalRouterPort{Name: lrpName}
 	err := nbClient.Get(ctx, existingLRP)
 	if err == nil {
-		klog.V(4).Infof("Gateway router port %s already exists, external connectivity is configured", lrpName)
-		return nil
+		// Check if gateway chassis is already set
+		if len(existingLRP.GatewayChassis) > 0 {
+			klog.V(4).Infof("Gateway router port %s already exists with gateway chassis, external connectivity is configured", lrpName)
+			return nil
+		}
+		// Router port exists but no gateway chassis - need to add it
+		klog.Infof("Gateway router port %s exists but missing gateway chassis, adding it", lrpName)
+		return o.addGatewayChassisToExistingPort(ctx, existingLRP, chassisID, gwChassisName)
 	}
 	if err != client.ErrNotFound {
 		return fmt.Errorf("failed to check gateway router port: %w", err)
@@ -1723,12 +1783,32 @@ func (o *LogicalRouterOps) EnsureExternalConnectivityInSingleTx(
 		ops = append(ops, mutateSwitchOps1...)
 	}
 
-	// 3. Create router port to external switch
+	// 3. Create Gateway Chassis - THIS IS CRITICAL FOR EXTERNAL CONNECTIVITY
+	// Without this, OVN doesn't know which physical node should handle the gateway traffic
+	gwChassis := &GatewayChassis{
+		UUID:        BuildNamedUUID(gwChassisName),
+		Name:        gwChassisName,
+		ChassisName: chassisID,
+		Priority:    1,
+		ExternalIDs: map[string]string{
+			"k8s.ovn.org/kind": "gateway-chassis",
+			"k8s.ovn.org/node": nodeName,
+		},
+	}
+
+	createGwChassisOps, err := nbClient.Create(gwChassis)
+	if err != nil {
+		return fmt.Errorf("failed to create gateway chassis operation: %w", err)
+	}
+	ops = append(ops, createGwChassisOps...)
+
+	// 4. Create router port to external switch WITH gateway chassis reference
 	lrp := &LogicalRouterPort{
-		UUID:     BuildNamedUUID(lrpName),
-		Name:     lrpName,
-		MAC:      gatewayMAC,
-		Networks: []string{network},
+		UUID:           BuildNamedUUID(lrpName),
+		Name:           lrpName,
+		MAC:            gatewayMAC,
+		Networks:       []string{network},
+		GatewayChassis: []string{gwChassis.UUID}, // Link to gateway chassis
 		ExternalIDs: map[string]string{
 			"k8s.ovn.org/kind": "gateway-router-port",
 			"k8s.ovn.org/node": nodeName,
@@ -1867,7 +1947,67 @@ func (o *LogicalRouterOps) EnsureExternalConnectivityInSingleTx(
 		return fmt.Errorf("external connectivity creation failed: %w", err)
 	}
 
-	klog.Infof("Created external connectivity for node %s: switch=%s, router-port=%s, nextHop=%s",
-		nodeName, extSwitchName, lrpName, nextHop)
+	klog.Infof("Created external connectivity for node %s: switch=%s, router-port=%s, gateway-chassis=%s, nextHop=%s",
+		nodeName, extSwitchName, lrpName, gwChassisName, nextHop)
+	return nil
+}
+
+// addGatewayChassisToExistingPort adds a gateway chassis to an existing router port
+// This is used when the router port exists but is missing the gateway chassis binding
+func (o *LogicalRouterOps) addGatewayChassisToExistingPort(ctx context.Context, lrp *LogicalRouterPort, chassisID, gwChassisName string) error {
+	nbClient := o.client.NBClient()
+	if nbClient == nil {
+		return fmt.Errorf("NB client is not connected")
+	}
+
+	var ops []ovsdb.Operation
+
+	// Create Gateway Chassis
+	gwChassis := &GatewayChassis{
+		UUID:        BuildNamedUUID(gwChassisName),
+		Name:        gwChassisName,
+		ChassisName: chassisID,
+		Priority:    1,
+		ExternalIDs: map[string]string{
+			"k8s.ovn.org/kind": "gateway-chassis",
+		},
+	}
+
+	createGwChassisOps, err := nbClient.Create(gwChassis)
+	if err != nil {
+		return fmt.Errorf("failed to create gateway chassis operation: %w", err)
+	}
+	ops = append(ops, createGwChassisOps...)
+
+	// Update router port to reference the gateway chassis
+	mutateLrpOps, err := nbClient.Where(lrp).Mutate(lrp, model.Mutation{
+		Field:   &lrp.GatewayChassis,
+		Mutator: ovsdb.MutateOperationInsert,
+		Value:   []string{gwChassis.UUID},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create router port mutation: %w", err)
+	}
+	ops = append(ops, mutateLrpOps...)
+
+	// Execute transaction
+	results, err := nbClient.Transact(ctx, ops...)
+	if err != nil {
+		if isDuplicateError(err) {
+			klog.V(4).Infof("Gateway chassis %s already exists", gwChassisName)
+			return nil
+		}
+		return fmt.Errorf("failed to add gateway chassis: %w", err)
+	}
+
+	if err := checkTransactResults(results); err != nil {
+		if isDuplicateError(err) {
+			klog.V(4).Infof("Gateway chassis %s already exists (constraint violation)", gwChassisName)
+			return nil
+		}
+		return fmt.Errorf("gateway chassis creation failed: %w", err)
+	}
+
+	klog.Infof("Added gateway chassis %s to router port %s", gwChassisName, lrp.Name)
 	return nil
 }

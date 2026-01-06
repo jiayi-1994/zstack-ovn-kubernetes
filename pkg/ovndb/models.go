@@ -120,6 +120,19 @@ type LogicalRouterPort struct {
 	HaChassisGroup *string           `ovsdb:"ha_chassis_group"`
 }
 
+// GatewayChassis represents an OVN Gateway Chassis
+// A gateway chassis specifies which physical chassis should handle traffic for a gateway router port.
+// This is essential for external network connectivity - without it, OVN doesn't know which node
+// should process traffic going to/from the external network.
+type GatewayChassis struct {
+	UUID        string            `ovsdb:"_uuid"`
+	Name        string            `ovsdb:"name"`
+	ChassisName string            `ovsdb:"chassis_name"`
+	Priority    int               `ovsdb:"priority"`
+	Options     map[string]string `ovsdb:"options"`
+	ExternalIDs map[string]string `ovsdb:"external_ids"`
+}
+
 // LogicalRouterStaticRoute represents a static route on a logical router
 type LogicalRouterStaticRoute struct {
 	UUID        string            `ovsdb:"_uuid"`
@@ -340,6 +353,7 @@ const (
 	AddressSetTable               = "Address_Set"
 	PortGroupTable                = "Port_Group"
 	NBGlobalTable                 = "NB_Global"
+	GatewayChassisTable           = "Gateway_Chassis"
 	ChassisTable                  = "Chassis"
 	EncapTable                    = "Encap"
 	PortBindingTable              = "Port_Binding"
@@ -360,6 +374,7 @@ func NBDBModel() (model.ClientDBModel, error) {
 		AddressSetTable:               &AddressSet{},
 		PortGroupTable:                &PortGroup{},
 		NBGlobalTable:                 &NBGlobal{},
+		GatewayChassisTable:           &GatewayChassis{},
 	})
 	if err != nil {
 		return model.ClientDBModel{}, err
@@ -375,6 +390,7 @@ func NBDBModel() (model.ClientDBModel, error) {
 		LoadBalancerTable:      {{Columns: []model.ColumnKey{{Column: "name"}}}},
 		AddressSetTable:        {{Columns: []model.ColumnKey{{Column: "name"}}}},
 		PortGroupTable:         {{Columns: []model.ColumnKey{{Column: "name"}}}},
+		GatewayChassisTable:    {{Columns: []model.ColumnKey{{Column: "name"}}}},
 	})
 
 	return dbModel, nil
