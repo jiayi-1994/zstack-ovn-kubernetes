@@ -181,6 +181,14 @@ func (s *SyncManager) RunFullSync(ctx context.Context) (*SyncResult, error) {
 		klog.Info("NAT rules sync completed")
 	}
 
+	// 6. Sync external connectivity (repair missing router-to-external connections)
+	if err := s.syncExternalConnectivity(ctx); err != nil {
+		result.Errors = append(result.Errors, fmt.Errorf("external connectivity sync failed: %w", err))
+		klog.Errorf("External connectivity sync failed: %v", err)
+	} else {
+		klog.Info("External connectivity sync completed")
+	}
+
 	result.Duration = time.Since(startTime)
 
 	if len(result.Errors) > 0 {
@@ -248,7 +256,7 @@ func (s *SyncManager) cleanupDuplicateSwitches(ctx context.Context) error {
 			}
 
 			klog.Infof("Deleting duplicate switch %s (UUID: %s)", sw.Name, sw.UUID)
-			
+
 			// Delete by UUID directly using the client
 			nbClient := s.ovnClient.NBClient()
 			if nbClient != nil {
@@ -475,7 +483,7 @@ func (s *SyncManager) syncSubnets(ctx context.Context) (*syncResult, error) {
 					"exclude_ips": subnet.Spec.Gateway,
 				},
 				ExternalIDs: map[string]string{
-					"k8s.io/subnet": subnet.Name,
+					"k8s.io/subnet":  subnet.Name,
 					"zstack.io/type": "subnet-switch",
 				},
 			}
@@ -765,6 +773,139 @@ func (s *SyncManager) RecoverMissingResources(ctx context.Context) error {
 		klog.Errorf("Subnet recovery failed: %v", err)
 	}
 
+	// Recover external connectivity
+	if err := s.syncExternalConnectivity(ctx); err != nil {
+		klog.Errorf("External connectivity recovery failed: %v", err)
+	}
+
 	klog.Info("Missing resource recovery completed")
 	return nil
+}
+
+// syncExternalConnectivity ensures external network connectivity is properly configured.
+// This checks if the external switch is connected to the cluster router and fixes it if not.
+func (s *SyncManager) syncExternalConnectivity(ctx context.Context) error {
+	if s.ovnClient == nil || !s.ovnClient.IsConnected() {
+		klog.V(4).Info("OVN client not connected, skipping external connectivity sync")
+		return nil
+	}
+
+	// Get all nodes
+	nodeList := &corev1.NodeList{}
+	if err := s.client.List(ctx, nodeList); err != nil {
+		return fmt.Errorf("failed to list nodes: %w", err)
+	}
+
+	if len(nodeList.Items) == 0 {
+		klog.V(4).Info("No nodes found, skipping external connectivity sync")
+		return nil
+	}
+
+	// Check each node's external connectivity
+	for _, node := range nodeList.Items {
+		nodeName := node.Name
+		extSwitchName := ovndb.GetExternalSwitchName(nodeName)
+		lrpName := ovndb.GatewayRouterPortPrefix + nodeName
+
+		// Check if external switch exists
+		_, err := s.lsOps.GetLogicalSwitch(ctx, extSwitchName)
+		if ovndb.IsNotFound(err) {
+			klog.V(4).Infof("External switch %s not found for node %s, will be created by NodeController", extSwitchName, nodeName)
+			continue
+		}
+		if err != nil {
+			klog.Warningf("Failed to check external switch %s: %v", extSwitchName, err)
+			continue
+		}
+
+		// Check if router port exists (connection to cluster router)
+		nbClient := s.ovnClient.NBClient()
+		if nbClient == nil {
+			continue
+		}
+
+		lrp := &ovndb.LogicalRouterPort{Name: lrpName}
+		err = nbClient.Get(ctx, lrp)
+		if err == nil {
+			klog.V(4).Infof("External connectivity for node %s is properly configured", nodeName)
+			continue
+		}
+
+		// Router port missing - need to fix
+		klog.Warningf("External switch %s exists but router port %s is missing for node %s, attempting repair...",
+			extSwitchName, lrpName, nodeName)
+
+		// Get node's internal IP
+		var nodeIP string
+		for _, addr := range node.Status.Addresses {
+			if addr.Type == corev1.NodeInternalIP {
+				nodeIP = addr.Address
+				break
+			}
+		}
+		if nodeIP == "" {
+			klog.Warningf("No internal IP found for node %s, cannot repair external connectivity", nodeName)
+			continue
+		}
+
+		// Detect gateway
+		nextHop := s.inferNodeGateway(nodeIP)
+		if nextHop == "" {
+			klog.Warningf("Cannot infer gateway for node %s, cannot repair external connectivity", nodeName)
+			continue
+		}
+
+		// Generate MAC
+		gatewayMAC := s.generateRouterPortMAC(net.ParseIP(nodeIP))
+
+		// Get physical network from config
+		physicalNetwork := s.config.Gateway.Interface
+		if physicalNetwork == "" {
+			physicalNetwork = "external"
+		}
+		vlanID := s.config.Gateway.VLANID
+
+		// Use single transaction method to repair
+		if err := s.lrOps.EnsureExternalConnectivityInSingleTx(
+			ctx,
+			nodeName,
+			nodeIP,
+			gatewayMAC,
+			nextHop,
+			physicalNetwork,
+			vlanID,
+		); err != nil {
+			klog.Errorf("Failed to repair external connectivity for node %s: %v", nodeName, err)
+		} else {
+			klog.Infof("Repaired external connectivity for node %s", nodeName)
+		}
+	}
+
+	return nil
+}
+
+// inferNodeGateway infers the default gateway IP from the node's IP.
+func (s *SyncManager) inferNodeGateway(nodeIP string) string {
+	ip := net.ParseIP(nodeIP)
+	if ip == nil {
+		return ""
+	}
+
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return ""
+	}
+
+	// Assume /24 subnet and gateway at .1
+	gateway := net.IPv4(ip4[0], ip4[1], ip4[2], 1)
+	return gateway.String()
+}
+
+// generateRouterPortMAC generates a MAC address for a router port based on the gateway IP.
+func (s *SyncManager) generateRouterPortMAC(ip net.IP) string {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return "0a:58:00:00:00:01"
+	}
+	return fmt.Sprintf("0a:58:%02x:%02x:%02x:%02x", ip4[0], ip4[1], ip4[2], ip4[3])
 }

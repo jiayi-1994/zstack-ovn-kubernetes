@@ -999,7 +999,7 @@ func (c *NodeController) inferNodeGateway(nodeIP string) string {
 //
 //	cluster-router -> external-switch (ext_<node>) -> localnet port -> br-ex -> physical network
 //
-// This creates:
+// This creates (in a single transaction to avoid cache sync issues):
 // 1. External switch with localnet port connecting to physical network
 // 2. Router port on cluster router connecting to external switch
 // 3. Default route via external gateway
@@ -1016,18 +1016,21 @@ func (c *NodeController) ensureExternalConnectivity(ctx context.Context, node *c
 	// Get VLAN ID from config (0 for untagged)
 	vlanID := c.config.Gateway.VLANID
 
-	// Create external switch with localnet port
-	_, err := c.lrOps.EnsureExternalSwitch(ctx, node.Name, physicalNetwork, vlanID)
-	if err != nil {
-		return fmt.Errorf("failed to create external switch: %w", err)
-	}
-
 	// Generate MAC address for gateway port
 	gatewayMAC := c.generateRouterPortMAC(net.ParseIP(nodeIP))
 
-	// Connect cluster router to external switch
-	if err := c.lrOps.EnsureGatewayRouterToExternal(ctx, node.Name, nodeIP, gatewayMAC, nextHop); err != nil {
-		return fmt.Errorf("failed to connect router to external: %w", err)
+	// Use single transaction method to avoid cache sync issues between
+	// creating external switch and connecting it to the router
+	if err := c.lrOps.EnsureExternalConnectivityInSingleTx(
+		ctx,
+		node.Name,
+		nodeIP,
+		gatewayMAC,
+		nextHop,
+		physicalNetwork,
+		vlanID,
+	); err != nil {
+		return fmt.Errorf("failed to configure external connectivity: %w", err)
 	}
 
 	klog.Infof("External connectivity configured for node %s: nodeIP=%s, nextHop=%s, physicalNetwork=%s",
