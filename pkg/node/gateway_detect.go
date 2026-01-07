@@ -492,3 +492,88 @@ func GetChassisID() (string, error) {
 
 	return chassisID, nil
 }
+
+// GetPatchPortName returns the patch port name connecting br-ex to br-int for a given localnet port.
+// The patch port is created by OVN when a localnet port is configured.
+// Format: patch-<localnet-port>-to-br-int
+func GetPatchPortName(nodeName string) string {
+	return fmt.Sprintf("patch-ln-%s-to-br-int", nodeName)
+}
+
+// GetPhysicalPortOnBridge returns the physical interface port on the bridge.
+// This is the interface that was migrated to br-ex (e.g., ens3, eth0).
+func GetPhysicalPortOnBridge(bridgeName string) (string, error) {
+	output, err := exec.Command("ovs-vsctl", "--timeout=5", "list-ports", bridgeName).Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to list ports on %s: %w", bridgeName, err)
+	}
+
+	ports := strings.Split(strings.TrimSpace(string(output)), "\n")
+	for _, port := range ports {
+		port = strings.TrimSpace(port)
+		if port == "" {
+			continue
+		}
+		// Skip patch ports and internal ports
+		if strings.HasPrefix(port, "patch-") {
+			continue
+		}
+		// This should be the physical interface
+		return port, nil
+	}
+
+	return "", fmt.Errorf("no physical port found on bridge %s", bridgeName)
+}
+
+// GetBridgeMAC returns the MAC address of the bridge.
+func GetBridgeMAC(bridgeName string) (string, error) {
+	link, err := netlink.LinkByName(bridgeName)
+	if err != nil {
+		return "", fmt.Errorf("failed to get link %s: %w", bridgeName, err)
+	}
+	return link.Attrs().HardwareAddr.String(), nil
+}
+
+// SetupOpenFlowRules configures OpenFlow rules on br-ex for proper traffic handling.
+// This is the key to making return traffic work correctly:
+// - Outbound traffic from OVN is marked with ct_mark=CtMarkOVN
+// - Return traffic is checked against conntrack and forwarded to OVN if ct_mark=CtMarkOVN
+//
+// Parameters:
+//   - nodeName: Name of the node (used to find patch port)
+//   - bridgeName: Name of the external bridge (usually "br-ex")
+//   - nodeIP: Node's external IP address
+//   - clusterCIDR: Cluster CIDR for pod traffic
+//
+// Returns:
+//   - error: Setup error
+func SetupOpenFlowRules(nodeName, bridgeName, nodeIP, clusterCIDR string) error {
+	// Get patch port name
+	patchPort := GetPatchPortName(nodeName)
+
+	// Verify patch port exists
+	if err := exec.Command("ovs-vsctl", "--timeout=5", "get", "Interface", patchPort, "ofport").Run(); err != nil {
+		klog.Warningf("Patch port %s not found, OpenFlow rules may not work correctly: %v", patchPort, err)
+		// Don't fail - the patch port might be created later by OVN
+	}
+
+	// Get physical port
+	physPort, err := GetPhysicalPortOnBridge(bridgeName)
+	if err != nil {
+		return fmt.Errorf("failed to get physical port: %w", err)
+	}
+
+	// Get bridge MAC
+	bridgeMAC, err := GetBridgeMAC(bridgeName)
+	if err != nil {
+		return fmt.Errorf("failed to get bridge MAC: %w", err)
+	}
+
+	// Create and setup OpenFlow manager
+	ofMgr := NewOpenFlowManager(bridgeName, patchPort, physPort, bridgeMAC, nodeIP, clusterCIDR)
+	if err := ofMgr.SetupFlows(); err != nil {
+		return fmt.Errorf("failed to setup OpenFlow rules: %w", err)
+	}
+
+	return nil
+}

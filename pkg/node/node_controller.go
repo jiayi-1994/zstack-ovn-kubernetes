@@ -1015,6 +1015,19 @@ func (c *NodeController) ensureDistributedGateway(ctx context.Context, node *cor
 		klog.V(4).Infof("Node %s is not the primary gateway, skipping SNAT configuration", node.Name)
 	}
 
+	// Setup OpenFlow rules on br-ex for proper return traffic handling
+	// This is critical for making external connectivity work in shared gateway mode
+	bridgeName := l3GwConfig.BridgeID
+	if bridgeName == "" {
+		bridgeName = "br-ex"
+	}
+	if err := SetupOpenFlowRules(node.Name, bridgeName, nodeIP, c.config.Network.ClusterCIDR); err != nil {
+		klog.Warningf("Failed to setup OpenFlow rules on %s for node %s: %v", bridgeName, node.Name, err)
+		// Don't fail - OpenFlow rules can be set up manually or retried later
+	} else {
+		klog.Infof("OpenFlow rules configured on %s for node %s", bridgeName, node.Name)
+	}
+
 	return nil
 }
 
